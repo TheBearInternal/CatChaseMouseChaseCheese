@@ -268,6 +268,7 @@ class DataManager:
         self.medium_primary: MediumBuffer = MediumBuffer()
         self.slow_buffer: SlowBuffer = SlowBuffer()
         self._session_open_ts: Optional[datetime] = None
+        self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -288,12 +289,13 @@ class DataManager:
             self.fast_benchmark.append(tick_data)
 
     async def ingest_bar(self, bar_data: Dict[str, Any]) -> None:
-        """Append a completed 1-minute bar to the MediumBuffer.
+        """Append a completed 1-minute bar to the MediumBuffer and _hist_bars.
 
         Args:
             bar_data: Dict with OHLCV fields and a ``timestamp`` key.
         """
         self.medium_primary.append(bar_data)
+        self._hist_bars.append(bar_data)
 
     # ------------------------------------------------------------------
     # Historical warm-up
@@ -356,13 +358,14 @@ class DataManager:
             primary_bars = _extract(symbol)
             bench_bars_all = _extract(benchmark_symbol)
 
-            # Populate primary MediumBuffer
+            # Populate _hist_bars (persists regardless of timestamp age) and
+            # medium_primary (live rolling window — historical bars may be evicted).
             for bar in primary_bars:
                 ts = bar.timestamp
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 vwap_val = float(bar.vwap) if getattr(bar, "vwap", None) else float(bar.close)
-                self.medium_primary.append({
+                bar_dict = {
                     "timestamp": ts,
                     "open": float(bar.open),
                     "high": float(bar.high),
@@ -370,9 +373,16 @@ class DataManager:
                     "close": float(bar.close),
                     "volume": float(bar.volume),
                     "vwap_contribution": vwap_val * float(bar.volume),
-                })
+                }
+                self._hist_bars.append(bar_dict)
+                self.medium_primary.append(bar_dict)
 
             # Populate benchmark FastBuffer from recent closes
+            if not bench_bars_all:
+                logger.warning(
+                    f"0 {benchmark_symbol} bars loaded — benchmark symbol may be "
+                    "unavailable on the IEX free data feed (NYSE Arca not covered)"
+                )
             bench_bars = bench_bars_all
             for bar in bench_bars[-RS_LOOKBACK_TICKS * 2:]:
                 ts = bar.timestamp
@@ -389,9 +399,14 @@ class DataManager:
                     "volume": float(bar.volume),
                 })
 
+            bench_note = (
+                f"{len(bench_bars)} {benchmark_symbol} bars"
+                if bench_bars
+                else f"0 {benchmark_symbol} bars (benchmark unavailable on IEX feed)"
+            )
             logger.info(
                 f"Warm-up: loaded {len(primary_bars)} {symbol} bars, "
-                f"{len(bench_bars)} {benchmark_symbol} bars — ready={self.is_ready}"
+                f"{bench_note} — ready={self.is_ready}"
             )
             return self.is_ready
 
@@ -443,11 +458,31 @@ class DataManager:
     # Readiness
     # ------------------------------------------------------------------
 
+    def to_dataframe(self) -> pd.DataFrame:
+        """Return bar data as a DataFrame, preferring live MediumBuffer.
+
+        Falls back to ``_hist_bars`` when the MediumBuffer has been time-evicted
+        below the readiness threshold (e.g. at session start before new bars arrive).
+
+        Returns:
+            DataFrame with one row per bar, or empty DataFrame if no data.
+        """
+        min_bars = MIN_BARS_DEV if config.dev_mode else MIN_BARS_NORMAL
+        if len(self.medium_primary) >= min_bars:
+            return self.medium_primary.to_dataframe()
+        if self._hist_bars:
+            return pd.DataFrame(list(self._hist_bars))
+        return pd.DataFrame()
+
     @property
     def is_ready(self) -> bool:
-        """Return True when enough bars are loaded for signal computation.
+        """Return True when enough primary bars are loaded for signal computation.
+
+        Checks ``_hist_bars`` (timestamp-independent) so warm-up bars are counted
+        even after MediumBuffer's 90-minute window evicts them.  Benchmark data
+        is supplementary and does not gate readiness.
 
         In DEV_MODE the requirement is reduced to ``MIN_BARS_DEV``.
         """
         min_bars = MIN_BARS_DEV if config.dev_mode else MIN_BARS_NORMAL
-        return len(self.medium_primary) >= min_bars
+        return len(self._hist_bars) >= min_bars
