@@ -337,12 +337,26 @@ class DataManager:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(None, _fetch)
 
-            # Populate primary MediumBuffer
+            # Extract raw bar lists from the multi-symbol BarSet.
+            # alpaca-py exposes a `.data` dict keyed by symbol; fall back to
+            # direct __getitem__ access for older SDK versions.
             try:
-                primary_bars = list(response[symbol])
-            except (KeyError, TypeError):
-                primary_bars = []
+                raw_data: dict = dict(response.data)
+            except (AttributeError, TypeError):
+                raw_data = {}
 
+            def _extract(sym: str) -> list:
+                if sym in raw_data:
+                    return list(raw_data[sym])
+                try:
+                    return list(response[sym])
+                except (KeyError, TypeError):
+                    return []
+
+            primary_bars = _extract(symbol)
+            bench_bars_all = _extract(benchmark_symbol)
+
+            # Populate primary MediumBuffer
             for bar in primary_bars:
                 ts = bar.timestamp
                 if ts.tzinfo is None:
@@ -359,11 +373,7 @@ class DataManager:
                 })
 
             # Populate benchmark FastBuffer from recent closes
-            try:
-                bench_bars = list(response[benchmark_symbol])
-            except (KeyError, TypeError):
-                bench_bars = []
-
+            bench_bars = bench_bars_all
             for bar in bench_bars[-RS_LOOKBACK_TICKS * 2:]:
                 ts = bar.timestamp
                 if ts.tzinfo is None:

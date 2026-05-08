@@ -323,12 +323,15 @@ class ConnectionManager:
 
         self._register_signal_handlers()
 
-        startup_delay = self._profile.get_connection_delay()
-        logger.info(
-            f"Applying randomized startup delay: {startup_delay:.2f}s "
-            "(sourced from BehaviorProfile)"
-        )
-        await asyncio.sleep(startup_delay)
+        if not config.dev_mode:
+            startup_delay = self._profile.get_connection_delay()
+            logger.info(
+                f"Applying randomized startup delay: {startup_delay:.2f}s "
+                "(sourced from BehaviorProfile)"
+            )
+            await asyncio.sleep(startup_delay)
+        else:
+            logger.debug("DEV_MODE: startup delay bypassed")
 
         health_task = asyncio.create_task(
             self._health_check_loop(), name="health-check"
