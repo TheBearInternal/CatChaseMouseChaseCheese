@@ -265,20 +265,39 @@ class ConnectionManager:
     # Signal handling
     # ------------------------------------------------------------------
 
+    def _schedule_shutdown(self, sig_name: str) -> None:
+        """Schedule the async shutdown coroutine from a synchronous signal context.
+
+        Required on Windows where ``signal.signal()`` callbacks are synchronous
+        and cannot directly await coroutines.  Uses ``call_soon_threadsafe`` so
+        it is safe to call from any thread.
+
+        Args:
+            sig_name: Signal name string used in the log message.
+        """
+        logger.info(f"Received {sig_name} — initiating graceful shutdown")
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(loop.create_task, self.shutdown())
+
     def _register_signal_handlers(self) -> None:
         """Register SIGINT and SIGTERM handlers for graceful shutdown.
 
-        Uses the running event loop's ``add_signal_handler`` so the signal
-        triggers an async shutdown coroutine rather than raising KeyboardInterrupt.
+        Attempts the Unix-style ``loop.add_signal_handler`` first.  Falls back
+        to ``signal.signal`` on Windows where ``add_signal_handler`` raises
+        ``NotImplementedError``; in that case only SIGINT is registered because
+        SIGTERM is not reliably available on Windows.
         """
         loop = asyncio.get_running_loop()
 
-        def _on_signal(sig_name: str) -> None:
-            logger.info(f"Received {sig_name} — initiating graceful shutdown")
-            asyncio.ensure_future(self.shutdown())
-
-        loop.add_signal_handler(signal.SIGINT, lambda: _on_signal("SIGINT"))
-        loop.add_signal_handler(signal.SIGTERM, lambda: _on_signal("SIGTERM"))
+        try:
+            loop.add_signal_handler(signal.SIGINT, lambda: self._schedule_shutdown("SIGINT"))
+            loop.add_signal_handler(signal.SIGTERM, lambda: self._schedule_shutdown("SIGTERM"))
+            logger.debug("Signal handlers registered via loop.add_signal_handler (Unix)")
+        except NotImplementedError:
+            # Windows fallback — synchronous signal.signal; SIGTERM omitted as it
+            # is not reliably available on Windows.
+            signal.signal(signal.SIGINT, lambda sig, frame: self._schedule_shutdown("SIGINT"))
+            logger.debug("Signal handlers registered via signal.signal (Windows fallback)")
 
     # ------------------------------------------------------------------
     # Public interface
