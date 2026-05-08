@@ -38,8 +38,9 @@ from phase1.connection import ConnectionManager
 from phase2.data import DataManager
 from phase2.ensemble import EnsembleDecision, InformationCoefficient, KalmanEnsemble
 from phase2.execution import OrderExecutor, TradeLogger
+from phase2.news_calendar import EventCalendar
 from phase2.regime import RegimeClassifier
-from phase2.sentiment import SentimentAnalyzer
+from phase2.sentiment import SentimentAnalyzer, get_nlp_backend_name
 from phase2.session import MarketCalendar, SessionManager
 from phase2.signals import SignalEngine
 from phase2.sizing import ATRSizer, GARCHSizer, SpreadAdjuster
@@ -204,7 +205,14 @@ async def _main() -> None:
         historical_client=historical_client,
     )
 
-    # 5. Data streaming connection — wired to DataManager -----------------
+    # 5. Log NLP backend and next economic event ----------------------------
+    _startup_calendar = EventCalendar(silent=True)
+    logger.info(
+        f"NLP backend: {get_nlp_backend_name()} | "
+        f"Next event: {_startup_calendar.next_event_summary()}"
+    )
+
+    # 6. Data streaming connection — wired to DataManager -----------------
     if config.is_forex():
         from phase2.forex import OANDAStreamingConnection
         _forex_benchmark = config.forex_benchmark
@@ -222,7 +230,7 @@ async def _main() -> None:
             data_manager=data_manager,
         )
 
-    # 6. Graceful shutdown event -------------------------------------------
+    # 7. Graceful shutdown event -------------------------------------------
     shutdown_event = asyncio.Event()
 
     def _request_shutdown(sig_name: str) -> None:
@@ -236,7 +244,7 @@ async def _main() -> None:
     except NotImplementedError:
         signal.signal(signal.SIGINT, lambda s, f: shutdown_event.set())
 
-    # 7. Launch tasks ------------------------------------------------------
+    # 8. Launch tasks ------------------------------------------------------
     sentiment_task = asyncio.create_task(
         sentiment_analyzer.run_poll_loop(), name="sentiment-poller"
     )

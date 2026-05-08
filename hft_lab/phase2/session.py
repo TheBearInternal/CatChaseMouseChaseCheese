@@ -30,6 +30,7 @@ from phase2.data import DataManager
 from phase2.ensemble import EnsembleDecision, InformationCoefficient, KalmanEnsemble
 from phase2.execution import OrderExecutor, TradeLogger
 from phase2.regime import RegimeClassifier, RegimeState
+from phase2.news_calendar import EventCalendar
 from phase2.sentiment import SentimentAnalyzer
 from phase2.signals import SignalEngine
 from phase2.sizing import ATRSizer, GARCHSizer, SpreadAdjuster
@@ -227,7 +228,9 @@ class SessionManager:
         self._historical_client = historical_client
         self._stop_event: asyncio.Event = asyncio.Event()
         self._in_pre_close: bool = False
-        self._last_state_save_ts: float = 0.0  # tracks rolling 24h saves in crypto mode
+        self._last_state_save_ts: float = 0.0
+        self._event_calendar: EventCalendar = EventCalendar(silent=False)
+        self._last_calendar_log_ts: float = 0.0
 
     def stop(self) -> None:
         """Signal the session loop to exit after the current iteration."""
@@ -399,31 +402,48 @@ class SessionManager:
         if self._in_pre_close:
             return
 
-        # 1. Regime classification
+        # 1. Event calendar risk check (logs transitions; 15-min summary log)
+        in_event_window, event = self._event_calendar.is_high_impact_window()
+        risk_mult = self._event_calendar.get_risk_multiplier()
+        threshold_mult = self._event_calendar.get_threshold_multiplier()
+        now_ts = time.time()
+        if now_ts - self._last_calendar_log_ts >= 900:
+            logger.info(f"CALENDAR | {self._event_calendar.next_event_summary()}")
+            self._last_calendar_log_ts = now_ts
+        if in_event_window and event is not None:
+            logger.debug(
+                f"CALENDAR | Window active: {event.name} ({event.impact}) "
+                f"risk_mult={risk_mult:.2f} threshold_mult={threshold_mult:.2f}"
+            )
+
+        # 2. Regime classification
         regime = self._regime.classify(self._dm)
 
-        # 2. Signal scores
+        # 3. Signal scores
         signal_scores = self._signals.compute_all(regime)
 
-        # 3. News sentiment
+        # 4. News sentiment
         sentiment = self._sentiment.current_sentiment
 
-        # 4. Kalman weights
+        # 5. Kalman weights
         weights = self._kalman.get_weights()
 
-        # 5. Ensemble decision
+        # 6. Ensemble decision
         decision = self._ensemble.decide(signal_scores, weights, regime, sentiment)
 
-        # 6. Act on non-HOLD decision
+        # 7. Act on non-HOLD decision
         if decision.action != "HOLD":
-            await self._handle_signal(decision, signal_scores, weights, regime)
+            await self._handle_signal(
+                decision, signal_scores, weights, regime,
+                risk_mult=risk_mult, threshold_mult=threshold_mult,
+            )
 
-        # 7. Check existing positions for fills and exits
+        # 8. Check existing positions for fills and exits
         closed_trades = await self._executor.check_positions()
         for trade in closed_trades:
             await self._on_trade_closed(trade, signal_scores)
 
-        # 8. Periodic GARCH re-fit
+        # 9. Periodic GARCH re-fit
         if self._garch.should_refit:
             await self._fit_garch()
 
@@ -433,18 +453,39 @@ class SessionManager:
         signal_scores: Dict[str, float],
         weights: Dict[str, float],
         regime: RegimeState,
+        risk_mult: float = 1.0,
+        threshold_mult: float = 1.0,
     ) -> None:
         """Evaluate and potentially execute a LONG or SHORT signal.
 
-        Checks position limits, sizes the trade, validates spread economics,
-        applies behavioral filters, then submits the bracket order.
+        Checks position limits, applies calendar threshold gate, sizes the
+        trade (with event risk scaling), validates spread economics, applies
+        behavioral filters, then submits the bracket order.
 
         Args:
-            decision:      EnsembleDecision Decision namedtuple.
-            signal_scores: Signal scores at this moment.
-            weights:       Kalman weights at this moment.
-            regime:        Current RegimeState.
+            decision:       EnsembleDecision Decision namedtuple.
+            signal_scores:  Signal scores at this moment.
+            weights:        Kalman weights at this moment.
+            regime:         Current RegimeState.
+            risk_mult:      Position-size multiplier from EventCalendar (≤1.0).
+            threshold_mult: Confidence-threshold multiplier from EventCalendar (≥1.0).
         """
+        # Calendar-adjusted confidence threshold gate
+        from phase2.ensemble import RegimeState as _RS
+        regime_thresholds = {
+            "RANDOM_WALK": config.ensemble_threshold_random,
+            "AMBIGUOUS": config.ensemble_threshold_ambiguous,
+        }
+        base_thresh = regime_thresholds.get(regime.value, config.ensemble_threshold)
+        adjusted_thresh = base_thresh * threshold_mult
+        if decision.confidence < adjusted_thresh:
+            logger.debug(
+                f"Signal gated by calendar: confidence={decision.confidence:.3f} "
+                f"< threshold={adjusted_thresh:.3f} "
+                f"(base={base_thresh:.3f} × mult={threshold_mult:.2f})"
+            )
+            return
+
         # Enforce position limit
         if len(self._executor.open_positions) >= config.max_open_positions:
             logger.debug("Position limit reached — skipping signal")
@@ -468,7 +509,7 @@ class SessionManager:
         except Exception:
             equity = config.account_limit
 
-        # Compute position size
+        # Compute base position size then apply event risk multiplier
         quantity = self._garch.compute_position_size(
             account_equity=equity,
             max_risk_pct=config.max_risk_per_trade_pct,
@@ -476,6 +517,7 @@ class SessionManager:
             current_price=price,
             profile_variance=self._profile.order_size_variance,
         )
+        quantity = max(config.min_position_size, int(quantity * risk_mult))
 
         # Compute stop and take-profit distances
         stop_dist = self._atr.compute_stop_distance()

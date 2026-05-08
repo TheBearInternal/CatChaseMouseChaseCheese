@@ -63,6 +63,8 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "OANDA_ACCOUNT_ID",
     "OANDA_ENVIRONMENT",
     "FOREX_BENCHMARK",
+    # News strategy keys
+    "REDDIT_SENTIMENT_ENABLED",
 )
 
 
@@ -186,6 +188,10 @@ class Config:
     oanda_account_id: str
     oanda_environment: str
     forex_benchmark: str
+    # News strategy fields
+    reddit_sentiment_enabled: bool
+    reddit_client_id: str
+    reddit_client_secret: str
 
     def is_live(self) -> bool:
         """Return ``True`` when connected to the live (real-money) Alpaca endpoint.
@@ -296,6 +302,12 @@ def _load_config() -> Config:
         oanda_account_id=_require_env("OANDA_ACCOUNT_ID"),
         oanda_environment=_require_env("OANDA_ENVIRONMENT"),
         forex_benchmark=_require_env("FOREX_BENCHMARK"),
+        # News strategy — Reddit is optional; credentials default to empty string
+        reddit_sentiment_enabled=_parse_bool(
+            _require_env("REDDIT_SENTIMENT_ENABLED"), "REDDIT_SENTIMENT_ENABLED"
+        ),
+        reddit_client_id=os.getenv("REDDIT_CLIENT_ID", ""),
+        reddit_client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
     )
 
 
