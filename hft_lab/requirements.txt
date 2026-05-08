@@ -44,3 +44,11 @@ requests==2.32.3
 
 # OANDA v20 API (forex market data and streaming)
 oandapyV20>=0.7.0
+
+# NLP / sentiment analysis
+transformers>=4.35.0
+torch>=2.0.0
+vaderSentiment>=3.3.1
+
+# Reddit data source
+praw>=7.7.0
