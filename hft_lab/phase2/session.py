@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -62,17 +62,28 @@ class MarketCalendar:
     """
 
     def is_market_open(self) -> bool:
-        """Return True if the current moment falls within regular market hours.
+        """Return True if the current moment falls within active market hours.
 
-        Crypto markets trade 24/7 and always return True.  Equity markets are
-        open Monday–Friday 09:30–16:00 EST; weekends and exchange holidays are
-        excluded.
+        * Crypto: always ``True`` (24/7).
+        * Forex: ``True`` from Sunday 17:00 EST through Friday 17:00 EST;
+          Saturday is fully closed; Sunday before 17:00 EST is closed.
+        * Equity: ``True`` Monday–Friday 09:30–16:00 EST.
 
         Returns:
             ``True`` when trading is active for the configured market type.
         """
         if config.is_crypto():
             return True
+        if config.is_forex():
+            now = datetime.now(EST)
+            weekday = now.weekday()
+            if weekday == 5:          # Saturday — always closed
+                return False
+            if weekday == 6:          # Sunday — open after 17:00
+                return now.hour >= 17
+            if weekday == 4:          # Friday — closes at 17:00
+                return now.hour < 17
+            return True               # Monday–Thursday always open
         now = datetime.now(EST)
         if now.weekday() >= 5:  # Saturday=5, Sunday=6
             return False
@@ -82,14 +93,27 @@ class MarketCalendar:
     def time_to_open(self) -> float:
         """Return seconds until the next market open.
 
-        For crypto markets always returns 0 (market never closes).
-        For equity, returns seconds until the next 09:30 EST weekday open.
+        * Crypto: always ``0`` (never closes).
+        * Forex: ``0`` if already open, otherwise seconds until next
+          Sunday 17:00 EST (the weekly open).
+        * Equity: seconds until the next 09:30 EST weekday open.
 
         Returns:
             Seconds as float.
         """
         if config.is_crypto():
             return 0.0
+        if config.is_forex():
+            if self.is_market_open():
+                return 0.0
+            now = datetime.now(EST)
+            # Advance day-by-day until we land on a Sunday at 17:00
+            candidate = now.replace(hour=17, minute=0, second=0, microsecond=0)
+            if now >= candidate:
+                candidate = candidate + timedelta(days=1)
+            while candidate.weekday() != 6:  # 6 = Sunday
+                candidate = candidate + timedelta(days=1)
+            return max(0.0, (candidate - now).total_seconds())
         now = datetime.now(EST)
         # Find next 09:30 on a weekday
         candidate = now.replace(
@@ -243,8 +267,9 @@ class SessionManager:
             while (self._calendar.is_market_open() or config.dev_mode) \
                     and not self._stop_event.is_set():
 
-                # Approaching-close wind-down is equity-only; crypto has no close.
-                if not config.is_crypto() \
+                # Approaching-close wind-down is equity-only.
+                # Crypto (24/7) and forex (weekend-aware) have no intraday close.
+                if not config.is_crypto() and not config.is_forex() \
                         and not self._in_pre_close \
                         and self._calendar.is_approaching_close() \
                         and not config.dev_mode:
@@ -261,8 +286,10 @@ class SessionManager:
                     )
                     await asyncio.sleep(ERROR_BACKOFF_S)
 
-                # Rolling 24-hour state persistence for crypto (no session close).
-                if config.is_crypto() and time.time() - self._last_state_save_ts >= 86400:
+                # Rolling 24-hour state persistence for crypto and forex
+                # (neither has a scheduled session close).
+                if (config.is_crypto() or config.is_forex()) \
+                        and time.time() - self._last_state_save_ts >= 86400:
                     await self._save_state()
                     self._last_state_save_ts = time.time()
 
@@ -284,6 +311,11 @@ class SessionManager:
                 "=== Session starting (24/7 CRYPTO MODE — no market-hours logic, "
                 "no session close, state saved every 24h) ==="
             )
+        elif config.is_forex():
+            logger.info(
+                "=== Session starting (FOREX MODE — 24/5 weekend-aware, "
+                "no session-close position flattening, state saved every 24h) ==="
+            )
         else:
             logger.info("=== Session starting ===")
         self._in_pre_close = False
@@ -296,9 +328,12 @@ class SessionManager:
             self._kalman.load_state(weights_state)
 
         # Select the correct benchmark symbol for the active market type
-        benchmark = (
-            config.crypto_benchmark if config.is_crypto() else config.benchmark_symbol
-        )
+        if config.is_crypto():
+            benchmark = config.crypto_benchmark
+        elif config.is_forex():
+            benchmark = config.forex_benchmark
+        else:
+            benchmark = config.benchmark_symbol
 
         # Warm up data buffers from historical API
         warmed = await self._dm.warm_up(
@@ -332,9 +367,9 @@ class SessionManager:
     async def _session_close(self) -> None:
         """Flatten remaining positions (equity only) and persist session state."""
         logger.info("=== Session closing ===")
-        # Crypto has no scheduled session close; positions are managed by the engine
-        # shutdown handler.  Only equity flattens on calendar close.
-        if not config.is_crypto() and not self._in_pre_close:
+        # Crypto and forex have no scheduled session close; the engine shutdown
+        # handler manages position flattening.  Equity flattens on calendar close.
+        if not config.is_crypto() and not config.is_forex() and not self._in_pre_close:
             await self._executor.close_all_positions("session_close")
 
         session_pnl = self._trade_logger.get_session_pnl()

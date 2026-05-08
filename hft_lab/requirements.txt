@@ -41,3 +41,6 @@ matplotlib==3.8.4
 
 # HTTP requests (REST calls, latency baseline)
 requests==2.32.3
+
+# OANDA v20 API (forex market data and streaming)
+oandapyV20>=0.7.0

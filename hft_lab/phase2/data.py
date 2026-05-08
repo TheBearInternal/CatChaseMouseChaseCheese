@@ -270,9 +270,14 @@ class DataManager:
         self._session_open_ts: Optional[datetime] = None
         self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
         self._is_crypto: bool = config.is_crypto()
-        logger.info(
-            f"DataManager initialised | mode={'CRYPTO (24/7 rolling VWAP)' if self._is_crypto else 'EQUITY (session VWAP)'}"
+        self._is_forex: bool = config.is_forex()
+        self._vwap_proxy_logged: bool = False  # log forex tick-volume note once
+        _mode = (
+            "CRYPTO (24/7 rolling VWAP)" if self._is_crypto else
+            "FOREX (24h rolling VWAP, tick-count volume)" if self._is_forex else
+            "EQUITY (session VWAP)"
         )
+        logger.info(f"DataManager initialised | mode={_mode}")
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -326,6 +331,9 @@ class DataManager:
         Returns:
             ``True`` when ``is_ready`` is satisfied after loading.
         """
+        if config.is_forex():
+            return await self._warm_up_forex(symbol, benchmark_symbol, n_bars)
+
         from alpaca.data.timeframe import TimeFrame
 
         def _fetch() -> Any:
@@ -435,6 +443,73 @@ class DataManager:
             logger.error(f"Warm-up failed: {exc!r}")
             return False
 
+    async def _warm_up_forex(
+        self, symbol: str, benchmark_symbol: str, n_bars: int
+    ) -> bool:
+        """Warm up from OANDA REST API historical candles (forex mode).
+
+        Args:
+            symbol:           Primary instrument, e.g. ``"EUR_USD"``.
+            benchmark_symbol: Benchmark instrument, e.g. ``"GBP_USD"``.
+            n_bars:           Number of candles to request.
+
+        Returns:
+            ``True`` when ``is_ready`` is satisfied after loading.
+        """
+        from phase2.forex import OANDAHistoricalFetcher
+
+        def _fetch() -> tuple:
+            fetcher = OANDAHistoricalFetcher(
+                config.oanda_api_key,
+                config.oanda_account_id,
+                config.oanda_environment,
+            )
+            return (
+                fetcher.fetch_candles(symbol, count=n_bars),
+                fetcher.fetch_candles(benchmark_symbol, count=n_bars),
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+            primary_bars, bench_bars = await loop.run_in_executor(None, _fetch)
+
+            for bar in primary_bars:
+                self._hist_bars.append(bar)
+                self.medium_primary.append(bar)
+
+            if not bench_bars:
+                logger.warning(
+                    f"0 {benchmark_symbol} forex bars loaded — "
+                    "check OANDA instrument availability"
+                )
+
+            for bar in bench_bars[-RS_LOOKBACK_TICKS * 2:]:
+                self.fast_benchmark.append({
+                    "timestamp": bar["timestamp"],
+                    "symbol": benchmark_symbol,
+                    "price": bar["close"],
+                    "bid": None,
+                    "ask": None,
+                    "bid_size": 0,
+                    "ask_size": 0,
+                    "volume": bar["volume"],
+                })
+
+            bench_note = (
+                f"{len(bench_bars)} {benchmark_symbol} bars"
+                if bench_bars
+                else f"0 {benchmark_symbol} bars (unavailable)"
+            )
+            logger.info(
+                f"FOREX Warm-up: loaded {len(primary_bars)} {symbol} bars, "
+                f"{bench_note} — ready={self.is_ready}"
+            )
+            return self.is_ready
+
+        except Exception as exc:
+            logger.error(f"FOREX warm-up failed: {exc!r}")
+            return False
+
     # ------------------------------------------------------------------
     # Derived metrics
     # ------------------------------------------------------------------
@@ -442,8 +517,10 @@ class DataManager:
     def compute_vwap(self) -> Optional[float]:
         """Return VWAP from tick data.
 
-        For equity: cumulative from session open (resets daily at 09:30 EST).
-        For crypto: rolling 24-hour window regardless of time.
+        * Equity: cumulative from session open (resets daily at 09:30 EST).
+        * Crypto / Forex: rolling 24-hour window.  For forex, tick count
+          (``volume=1`` per tick) is used as the volume proxy; a one-time
+          DEBUG message is logged on first call to make this explicit.
 
         Returns:
             VWAP as float, or ``None`` if insufficient data.
@@ -453,7 +530,12 @@ class DataManager:
             return None
 
         if "timestamp" in df.columns:
-            if self._is_crypto:
+            if self._is_crypto or self._is_forex:
+                if self._is_forex and not self._vwap_proxy_logged:
+                    logger.debug(
+                        "FOREX mode: using tick count as VWAP volume proxy"
+                    )
+                    self._vwap_proxy_logged = True
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
                 df = df[df["timestamp"] >= cutoff]
             elif self._session_open_ts is not None:

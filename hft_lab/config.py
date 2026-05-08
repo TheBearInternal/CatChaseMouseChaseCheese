@@ -59,6 +59,10 @@ REQUIRED_KEYS: tuple[str, ...] = (
     # Phase 6 keys
     "MARKET_TYPE",
     "CRYPTO_BENCHMARK",
+    "OANDA_API_KEY",
+    "OANDA_ACCOUNT_ID",
+    "OANDA_ENVIRONMENT",
+    "FOREX_BENCHMARK",
 )
 
 
@@ -178,6 +182,10 @@ class Config:
     # Phase 6 fields
     market_type: str
     crypto_benchmark: str
+    oanda_api_key: str
+    oanda_account_id: str
+    oanda_environment: str
+    forex_benchmark: str
 
     def is_live(self) -> bool:
         """Return ``True`` when connected to the live (real-money) Alpaca endpoint.
@@ -201,6 +209,17 @@ class Config:
             ``True`` when ``market_type`` is ``"crypto"``.
         """
         return self.market_type.lower() == "crypto"
+
+    def is_forex(self) -> bool:
+        """Return ``True`` when the engine is configured for forex markets.
+
+        Forex mode routes data through the OANDA v20 API, applies 24/5
+        weekend-aware market-hours logic, and uses tick-count VWAP.
+
+        Returns:
+            ``True`` when ``market_type`` is ``"forex"``.
+        """
+        return self.market_type.lower() == "forex"
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +246,10 @@ def _load_config() -> Config:
 
     # Validate MARKET_TYPE is a recognised value
     market_type_raw = _require_env("MARKET_TYPE").lower()
-    if market_type_raw not in ("equity", "crypto"):
+    if market_type_raw not in ("equity", "crypto", "forex"):
         raise ConfigurationError(
-            f"MARKET_TYPE must be 'equity' or 'crypto', got: {market_type_raw!r}"
+            f"MARKET_TYPE must be 'equity', 'crypto', or 'forex', "
+            f"got: {market_type_raw!r}"
         )
 
     return Config(
@@ -272,6 +292,10 @@ def _load_config() -> Config:
         # Phase 6
         market_type=market_type_raw,
         crypto_benchmark=_require_env("CRYPTO_BENCHMARK"),
+        oanda_api_key=_require_env("OANDA_API_KEY"),
+        oanda_account_id=_require_env("OANDA_ACCOUNT_ID"),
+        oanda_environment=_require_env("OANDA_ENVIRONMENT"),
+        forex_benchmark=_require_env("FOREX_BENCHMARK"),
     )
 
 

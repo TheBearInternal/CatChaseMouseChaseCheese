@@ -204,11 +204,23 @@ async def _main() -> None:
         historical_client=historical_client,
     )
 
-    # 5. Phase 1 WebSocket connection wired to DataManager -----------------
-    connection_manager = TradingConnectionManager(
-        profile=profile,
-        data_manager=data_manager,
-    )
+    # 5. Data streaming connection — wired to DataManager -----------------
+    if config.is_forex():
+        from phase2.forex import OANDAStreamingConnection
+        _forex_benchmark = config.forex_benchmark
+        stream_connection = OANDAStreamingConnection(
+            api_key=config.oanda_api_key,
+            account_id=config.oanda_account_id,
+            environment=config.oanda_environment,
+            instruments=[config.primary_symbol, _forex_benchmark],
+            data_manager=data_manager,
+        )
+    else:
+        # Equity and crypto both use the Alpaca WebSocket bridge
+        stream_connection = TradingConnectionManager(
+            profile=profile,
+            data_manager=data_manager,
+        )
 
     # 6. Graceful shutdown event -------------------------------------------
     shutdown_event = asyncio.Event()
@@ -229,7 +241,7 @@ async def _main() -> None:
         sentiment_analyzer.run_poll_loop(), name="sentiment-poller"
     )
     ws_task = asyncio.create_task(
-        connection_manager.run(), name="websocket-stream"
+        stream_connection.run(), name="websocket-stream"
     )
     session_task = asyncio.create_task(
         session_manager.run(), name="session-manager"
@@ -238,14 +250,24 @@ async def _main() -> None:
         shutdown_event.wait(), name="shutdown-watcher"
     )
 
-    active_benchmark = (
-        config.crypto_benchmark if config.is_crypto() else config.benchmark_symbol
-    )
-    logger.info(
-        f"Engine running | market={'CRYPTO' if config.is_crypto() else 'EQUITY'} "
-        f"symbol={config.primary_symbol} benchmark={active_benchmark} "
-        f"live={config.is_live()} dev={config.dev_mode}"
-    )
+    if config.is_forex():
+        logger.info(
+            f"Engine running | market=FOREX symbol={config.primary_symbol} "
+            f"benchmark={config.forex_benchmark} env={config.oanda_environment} "
+            f"dev={config.dev_mode}"
+        )
+    elif config.is_crypto():
+        logger.info(
+            f"Engine running | market=CRYPTO symbol={config.primary_symbol} "
+            f"benchmark={config.crypto_benchmark} "
+            f"live={config.is_live()} dev={config.dev_mode}"
+        )
+    else:
+        logger.info(
+            f"Engine running | market=EQUITY symbol={config.primary_symbol} "
+            f"benchmark={config.benchmark_symbol} "
+            f"live={config.is_live()} dev={config.dev_mode}"
+        )
 
     try:
         done, pending = await asyncio.wait(
@@ -296,9 +318,9 @@ async def _main() -> None:
         except Exception as exc:
             logger.error(f"Error saving session state on shutdown: {exc!r}")
 
-        # Shut down WebSocket
+        # Shut down data stream (Alpaca WebSocket or OANDA stream)
         try:
-            await connection_manager.shutdown()
+            await stream_connection.shutdown()
         except Exception:
             pass
 
