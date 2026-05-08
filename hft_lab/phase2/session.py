@@ -1,0 +1,486 @@
+"""Market calendar and session lifecycle management for hft_lab Phase 2.
+
+``MarketCalendar`` provides timezone-aware market-hours logic using the
+standard library ``zoneinfo`` module (Python 3.9+).
+
+``SessionManager`` owns the main trading loop.  It wakes on each tick,
+drives the full signal → regime → ensemble → execution pipeline, and handles
+all session lifecycle transitions:
+
+  closed → warm-up → active trading → pre-close → session close → sleep
+
+Crash safety: any exception inside the per-tick handler is caught, logged at
+ERROR, and the loop resumes after a brief backoff sleep rather than crashing.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import datetime, time as dtime, timezone
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+from config import config
+from logger import get_logger
+from phase1.behavior import BehaviorProfile, human_pause
+from phase2.data import DataManager
+from phase2.ensemble import EnsembleDecision, InformationCoefficient, KalmanEnsemble
+from phase2.execution import OrderExecutor, TradeLogger
+from phase2.regime import RegimeClassifier, RegimeState
+from phase2.sentiment import SentimentAnalyzer
+from phase2.signals import SignalEngine
+from phase2.sizing import ATRSizer, GARCHSizer, SpreadAdjuster
+
+logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EST = ZoneInfo("America/New_York")
+MARKET_OPEN_TIME: dtime = dtime(9, 30, 0)
+MARKET_CLOSE_TIME: dtime = dtime(16, 0, 0)
+PRE_CLOSE_MINUTES: int = 15
+
+TICK_INTERVAL_S: float = 1.0       # main loop cadence
+ERROR_BACKOFF_S: float = 5.0       # sleep after a per-tick exception
+
+
+# ---------------------------------------------------------------------------
+# MarketCalendar
+# ---------------------------------------------------------------------------
+
+
+class MarketCalendar:
+    """Timezone-aware NYSE/NASDAQ market hours logic.
+
+    All computations use the America/New_York timezone so DST transitions
+    are handled automatically via ``zoneinfo``.
+    """
+
+    def is_market_open(self) -> bool:
+        """Return True if the current moment falls within regular market hours.
+
+        Excludes weekends.  Does not account for exchange holidays.
+
+        Returns:
+            ``True`` between 09:30 and 16:00 EST on Monday–Friday.
+        """
+        now = datetime.now(EST)
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        t = now.time()
+        return MARKET_OPEN_TIME <= t < MARKET_CLOSE_TIME
+
+    def time_to_open(self) -> float:
+        """Return seconds until the next market open.
+
+        If the market is already open, returns 0.
+
+        Returns:
+            Seconds as float.
+        """
+        now = datetime.now(EST)
+        # Find next 09:30 on a weekday
+        candidate = now.replace(
+            hour=MARKET_OPEN_TIME.hour,
+            minute=MARKET_OPEN_TIME.minute,
+            second=0,
+            microsecond=0,
+        )
+        if now >= candidate:
+            candidate = candidate.replace(day=candidate.day + 1)
+        # Skip weekends
+        while candidate.weekday() >= 5:
+            candidate = candidate.replace(day=candidate.day + 1)
+        delta = (candidate - now).total_seconds()
+        return max(0.0, delta)
+
+    def time_to_close(self) -> float:
+        """Return seconds until today's market close.
+
+        Returns:
+            Seconds remaining, or 0 if market is closed.
+        """
+        now = datetime.now(EST)
+        close = now.replace(
+            hour=MARKET_CLOSE_TIME.hour,
+            minute=MARKET_CLOSE_TIME.minute,
+            second=0,
+            microsecond=0,
+        )
+        delta = (close - now).total_seconds()
+        return max(0.0, delta)
+
+    def is_approaching_close(self, minutes: int = PRE_CLOSE_MINUTES) -> bool:
+        """Return True if within ``minutes`` of the market close.
+
+        Args:
+            minutes: Lookahead window in minutes.
+
+        Returns:
+            ``True`` when time_to_close() < minutes × 60.
+        """
+        return 0 < self.time_to_close() < minutes * 60
+
+    def current_minute(self) -> int:
+        """Return minutes elapsed since today's market open (0-based).
+
+        Returns:
+            Integer in [0, 389], or -1 outside market hours.
+        """
+        now = datetime.now(EST)
+        open_today = now.replace(
+            hour=MARKET_OPEN_TIME.hour,
+            minute=MARKET_OPEN_TIME.minute,
+            second=0,
+            microsecond=0,
+        )
+        delta = (now - open_today).total_seconds()
+        minute = int(delta // 60)
+        return minute if 0 <= minute < 390 else -1
+
+
+# ---------------------------------------------------------------------------
+# SessionManager
+# ---------------------------------------------------------------------------
+
+
+class SessionManager:
+    """Orchestrates the full autonomous trading lifecycle for one session.
+
+    Responsibilities
+    ----------------
+    * Session open: warm up data, fit GARCH, restore Kalman weights.
+    * Active trading: per-tick signal→regime→ensemble→execution pipeline.
+    * Pre-close: stop opening new positions, begin closing existing ones.
+    * Session close: flatten all positions, save SlowBuffer snapshot.
+    * Between sessions: sleep until next market open.
+    """
+
+    def __init__(
+        self,
+        data_manager: DataManager,
+        signal_engine: SignalEngine,
+        regime_classifier: RegimeClassifier,
+        kalman_ensemble: KalmanEnsemble,
+        ic_tracker: InformationCoefficient,
+        ensemble_decision: EnsembleDecision,
+        sentiment_analyzer: SentimentAnalyzer,
+        garch_sizer: GARCHSizer,
+        atr_sizer: ATRSizer,
+        spread_adjuster: SpreadAdjuster,
+        order_executor: OrderExecutor,
+        trade_logger: TradeLogger,
+        market_calendar: MarketCalendar,
+        profile: BehaviorProfile,
+        historical_client: Any,
+    ) -> None:
+        self._dm = data_manager
+        self._signals = signal_engine
+        self._regime = regime_classifier
+        self._kalman = kalman_ensemble
+        self._ic = ic_tracker
+        self._ensemble = ensemble_decision
+        self._sentiment = sentiment_analyzer
+        self._garch = garch_sizer
+        self._atr = atr_sizer
+        self._spread = spread_adjuster
+        self._executor = order_executor
+        self._trade_logger = trade_logger
+        self._calendar = market_calendar
+        self._profile = profile
+        self._historical_client = historical_client
+        self._stop_event: asyncio.Event = asyncio.Event()
+        self._in_pre_close: bool = False
+
+    def stop(self) -> None:
+        """Signal the session loop to exit after the current iteration."""
+        self._stop_event.set()
+
+    # ------------------------------------------------------------------
+    # Main async loop
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Main session management loop — runs until ``stop()`` is called.
+
+        Handles market open/close transitions and delegates each tick to
+        ``_trading_tick()``.  Exceptions inside the tick handler are caught
+        and logged without crashing the loop.
+        """
+        logger.info("SessionManager started")
+
+        while not self._stop_event.is_set():
+            market_open = self._calendar.is_market_open() or config.dev_mode
+
+            if not market_open:
+                wait_s = self._calendar.time_to_open()
+                logger.info(f"Market closed — sleeping {wait_s / 3600:.1f}h until open")
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=min(wait_s, 60.0)
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # --- Session open ---
+            await self._session_start()
+
+            # --- Active trading ---
+            while (self._calendar.is_market_open() or config.dev_mode) \
+                    and not self._stop_event.is_set():
+
+                if not self._in_pre_close \
+                        and self._calendar.is_approaching_close() \
+                        and not config.dev_mode:
+                    await self._pre_close()
+
+                try:
+                    await self._trading_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        f"Trading tick error: {type(exc).__name__}: {exc}",
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(ERROR_BACKOFF_S)
+
+                await asyncio.sleep(TICK_INTERVAL_S)
+
+            # --- Session close ---
+            await self._session_close()
+
+        logger.info("SessionManager stopped")
+
+    # ------------------------------------------------------------------
+    # Session lifecycle handlers
+    # ------------------------------------------------------------------
+
+    async def _session_start(self) -> None:
+        """Initialise state at the beginning of a trading session."""
+        logger.info("=== Session starting ===")
+        self._in_pre_close = False
+        self._trade_logger.reset_session_pnl()
+
+        # Restore Kalman weights from previous session if available
+        self._dm.slow_buffer.load(config.session_state_path)
+        weights_state = self._dm.slow_buffer.data.get("signal_weights")
+        if weights_state:
+            self._kalman.load_state(weights_state)
+
+        # Warm up data buffers from historical API
+        warmed = await self._dm.warm_up(
+            self._historical_client,
+            config.primary_symbol,
+            config.benchmark_symbol,
+            config.historical_bars,
+        )
+        if not warmed:
+            logger.warning(
+                "Warm-up did not reach is_ready threshold — signals will be "
+                "suppressed until sufficient data accumulates"
+            )
+
+        # Fit GARCH on available historical returns
+        await self._fit_garch()
+
+        # Kalman prediction step at session open
+        self._kalman.predict()
+        logger.info("Session ready — trading loop active")
+
+    async def _pre_close(self) -> None:
+        """Handle pre-close wind-down: stop new entries, begin closing positions."""
+        logger.info(
+            f"Approaching market close ({PRE_CLOSE_MINUTES} min) — "
+            "stopping new entries, closing positions"
+        )
+        self._in_pre_close = True
+        await self._executor.close_all_positions("session_close")
+
+    async def _session_close(self) -> None:
+        """Flatten remaining positions and persist session state."""
+        logger.info("=== Session closing ===")
+        if not self._in_pre_close:
+            await self._executor.close_all_positions("session_close")
+
+        session_pnl = self._trade_logger.get_session_pnl()
+        logger.info(f"Session PnL — gross (approximate): ${session_pnl:.2f}")
+
+        # Persist state for next session
+        self._dm.slow_buffer.data.update({
+            "session_date": datetime.now(timezone.utc).isoformat(),
+            "session_pnl": session_pnl,
+            "signal_weights": self._kalman.save_state(),
+            "trade_count": self._dm.slow_buffer.data.get("trade_count", 0),
+        })
+        self._dm.slow_buffer.save(config.session_state_path)
+        logger.info("Session state saved")
+
+    # ------------------------------------------------------------------
+    # Per-tick trading pipeline
+    # ------------------------------------------------------------------
+
+    async def _trading_tick(self) -> None:
+        """Execute one iteration of the signal→decision→execution pipeline."""
+        if not self._dm.is_ready:
+            return
+
+        if self._in_pre_close:
+            return
+
+        # 1. Regime classification
+        regime = self._regime.classify(self._dm)
+
+        # 2. Signal scores
+        signal_scores = self._signals.compute_all(regime)
+
+        # 3. News sentiment
+        sentiment = self._sentiment.current_sentiment
+
+        # 4. Kalman weights
+        weights = self._kalman.get_weights()
+
+        # 5. Ensemble decision
+        decision = self._ensemble.decide(signal_scores, weights, regime, sentiment)
+
+        # 6. Act on non-HOLD decision
+        if decision.action != "HOLD":
+            await self._handle_signal(decision, signal_scores, weights, regime)
+
+        # 7. Check existing positions for fills and exits
+        closed_trades = await self._executor.check_positions()
+        for trade in closed_trades:
+            await self._on_trade_closed(trade, signal_scores)
+
+        # 8. Periodic GARCH re-fit
+        if self._garch.should_refit:
+            await self._fit_garch()
+
+    async def _handle_signal(
+        self,
+        decision: Any,
+        signal_scores: Dict[str, float],
+        weights: Dict[str, float],
+        regime: RegimeState,
+    ) -> None:
+        """Evaluate and potentially execute a LONG or SHORT signal.
+
+        Checks position limits, sizes the trade, validates spread economics,
+        applies behavioral filters, then submits the bracket order.
+
+        Args:
+            decision:      EnsembleDecision Decision namedtuple.
+            signal_scores: Signal scores at this moment.
+            weights:       Kalman weights at this moment.
+            regime:        Current RegimeState.
+        """
+        # Enforce position limit
+        if len(self._executor.open_positions) >= config.max_open_positions:
+            logger.debug("Position limit reached — skipping signal")
+            return
+
+        # Behavioral activity filter
+        current_min = self._calendar.current_minute()
+        if current_min >= 0 and not self._profile.should_act(current_min):
+            logger.debug(f"BehaviorProfile suppressed action at minute {current_min}")
+            return
+
+        # Fetch account equity for sizing
+        price = self._dm.fast_primary.latest_price()
+        if price is None:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            account = await loop.run_in_executor(None, self._executor._client.get_account)
+            equity = float(getattr(account, "equity", config.account_limit))
+        except Exception:
+            equity = config.account_limit
+
+        # Compute position size
+        quantity = self._garch.compute_position_size(
+            account_equity=equity,
+            max_risk_pct=config.max_risk_per_trade_pct,
+            confidence=decision.confidence,
+            current_price=price,
+            profile_variance=self._profile.order_size_variance,
+        )
+
+        # Compute stop and take-profit distances
+        stop_dist = self._atr.compute_stop_distance()
+        tp_dist = self._atr.compute_take_profit_distance(stop_dist)
+
+        # Spread viability check
+        expected_profit = tp_dist * quantity
+        if not self._spread.is_trade_worth_it(expected_profit, quantity):
+            logger.debug(
+                f"Trade not worth it: expected_profit={expected_profit:.2f} "
+                f"spread={self._spread.current_spread_dollars:.4f}"
+            )
+            return
+
+        # Human-pause timing randomization
+        await human_pause()
+
+        # Submit bracket order
+        await self._executor.submit_bracket_order(
+            side=decision.action,
+            quantity=quantity,
+            stop_distance=stop_dist,
+            take_profit_distance=tp_dist,
+            signal_scores=signal_scores,
+            weights=weights,
+            regime_name=regime.value,
+        )
+
+    async def _on_trade_closed(
+        self, trade: Any, current_signal_scores: Dict[str, float]
+    ) -> None:
+        """Update IC and run Kalman correction after a position closes.
+
+        Args:
+            trade:                Closed TradeRecord.
+            current_signal_scores: Signal scores at the time of closure check.
+        """
+        if trade.entry_price < 1e-6:
+            return
+
+        actual_return = (trade.exit_price - trade.entry_price) / trade.entry_price
+        if trade.side == "SHORT":
+            actual_return = -actual_return
+
+        from phase2.signals import SIGNAL_NAMES
+        for name in SIGNAL_NAMES:
+            pred = trade.signal_scores_at_entry.get(name, 0.0)
+            self._ic.update(name, pred, actual_return)
+
+        # Kalman correction step
+        ic_vector = np.array([self._ic.get_ic(n) for n in SIGNAL_NAMES])
+        self._kalman.update(ic_vector)
+
+        logger.info(
+            f"Trade closed: {trade.side} {trade.symbol} "
+            f"gross={trade.gross_pnl:+.2f} net={trade.net_pnl:+.2f} "
+            f"reason={trade.exit_reason} | "
+            f"session_pnl={self._trade_logger.get_session_pnl():+.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _fit_garch(self) -> None:
+        """Fit GARCH parameters on current MediumBuffer returns."""
+        df = self._dm.medium_primary.to_dataframe()
+        if len(df) < 30:
+            return
+        closes = df["close"].astype(float)
+        returns = np.log(closes / closes.shift(1)).dropna()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._garch.fit, returns)

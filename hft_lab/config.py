@@ -38,6 +38,24 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "SPREAD_ADJUSTMENT_ENABLED",
     "SLIPPAGE_FACTOR",
     "MIN_PROFIT_SPREAD_MULTIPLE",
+    # Phase 2 keys
+    "DEV_MODE",
+    "HISTORICAL_BARS",
+    "BAR_TIMEFRAME",
+    "TRADE_LOG_PATH",
+    "SESSION_STATE_PATH",
+    "ENSEMBLE_THRESHOLD",
+    "ENSEMBLE_THRESHOLD_AMBIGUOUS",
+    "ENSEMBLE_THRESHOLD_RANDOM",
+    "MAX_OPEN_POSITIONS",
+    "NEWS_POLL_INTERVAL",
+    "KALMAN_PROCESS_NOISE",
+    "KALMAN_MEASUREMENT_NOISE",
+    "IC_WINDOW",
+    "GARCH_UPDATE_INTERVAL",
+    "ATR_PERIOD",
+    "ATR_STOP_MULTIPLIER",
+    "RISK_REWARD_RATIO",
 )
 
 
@@ -136,6 +154,24 @@ class Config:
     spread_adjustment_enabled: bool
     slippage_factor: float
     min_profit_spread_multiple: float
+    # Phase 2 fields
+    dev_mode: bool
+    historical_bars: int
+    bar_timeframe: str
+    trade_log_path: str
+    session_state_path: str
+    ensemble_threshold: float
+    ensemble_threshold_ambiguous: float
+    ensemble_threshold_random: float
+    max_open_positions: int
+    news_poll_interval: int
+    kalman_process_noise: float
+    kalman_measurement_noise: float
+    ic_window: int
+    garch_update_interval: int
+    atr_period: int
+    atr_stop_multiplier: float
+    risk_reward_ratio: float
 
     def is_live(self) -> bool:
         """Return ``True`` when connected to the live (real-money) Alpaca endpoint.
@@ -191,6 +227,24 @@ def _load_config() -> Config:
         ),
         slippage_factor=float(_require_env("SLIPPAGE_FACTOR")),
         min_profit_spread_multiple=float(_require_env("MIN_PROFIT_SPREAD_MULTIPLE")),
+        # Phase 2
+        dev_mode=_parse_bool(_require_env("DEV_MODE"), "DEV_MODE"),
+        historical_bars=int(_require_env("HISTORICAL_BARS")),
+        bar_timeframe=_require_env("BAR_TIMEFRAME"),
+        trade_log_path=_require_env("TRADE_LOG_PATH"),
+        session_state_path=_require_env("SESSION_STATE_PATH"),
+        ensemble_threshold=float(_require_env("ENSEMBLE_THRESHOLD")),
+        ensemble_threshold_ambiguous=float(_require_env("ENSEMBLE_THRESHOLD_AMBIGUOUS")),
+        ensemble_threshold_random=float(_require_env("ENSEMBLE_THRESHOLD_RANDOM")),
+        max_open_positions=int(_require_env("MAX_OPEN_POSITIONS")),
+        news_poll_interval=int(_require_env("NEWS_POLL_INTERVAL")),
+        kalman_process_noise=float(_require_env("KALMAN_PROCESS_NOISE")),
+        kalman_measurement_noise=float(_require_env("KALMAN_MEASUREMENT_NOISE")),
+        ic_window=int(_require_env("IC_WINDOW")),
+        garch_update_interval=int(_require_env("GARCH_UPDATE_INTERVAL")),
+        atr_period=int(_require_env("ATR_PERIOD")),
+        atr_stop_multiplier=float(_require_env("ATR_STOP_MULTIPLIER")),
+        risk_reward_ratio=float(_require_env("RISK_REWARD_RATIO")),
     )
 
 
