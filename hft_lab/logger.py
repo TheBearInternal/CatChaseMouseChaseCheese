@@ -103,6 +103,12 @@ def _configure_root_logger() -> None:
     root.addHandler(console_handler)
     root.addHandler(file_handler)
 
+    # Suppress verbose DEBUG output from third-party libraries
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
+    logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
+
     _root_configured = True
 
 
