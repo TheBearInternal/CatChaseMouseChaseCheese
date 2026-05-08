@@ -1,0 +1,27 @@
+# Credentials — never commit these
+.env
+*secret*
+*key*
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Logs (generated at runtime)
+/logs/
+
+# macOS metadata
+.DS_Store
+
+# IDE / editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
