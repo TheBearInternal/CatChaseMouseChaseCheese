@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from alpaca.data.live import StockDataStream
+from alpaca.data.live import CryptoDataStream, StockDataStream
 
 from config import config
 from logger import get_logger
@@ -148,28 +148,43 @@ class ConnectionManager:
     # Stream construction
     # ------------------------------------------------------------------
 
-    def _build_stream(self) -> StockDataStream:
-        """Construct and subscribe a fresh StockDataStream instance.
+    def _build_stream(self) -> object:
+        """Construct and subscribe a fresh stream instance.
 
-        A new instance is created on every connection attempt so that stale
-        internal state from a previous dropout does not carry over.
+        Selects ``CryptoDataStream`` or ``StockDataStream`` based on
+        ``config.is_crypto()``.  A new instance is created on every connection
+        attempt so stale internal state from a previous dropout does not carry
+        over.
 
         Returns:
-            StockDataStream ready to run.
+            Stream object (CryptoDataStream or StockDataStream) ready to run.
         """
-        stream = StockDataStream(
-            api_key=config.alpaca_api_key,
-            secret_key=config.alpaca_secret_key,
+        benchmark = (
+            config.crypto_benchmark if config.is_crypto() else config.benchmark_symbol
         )
+
+        if config.is_crypto():
+            stream = CryptoDataStream(
+                api_key=config.alpaca_api_key,
+                secret_key=config.alpaca_secret_key,
+            )
+            logger.info("Stream type: CryptoDataStream (24/7 digital assets)")
+        else:
+            stream = StockDataStream(
+                api_key=config.alpaca_api_key,
+                secret_key=config.alpaca_secret_key,
+            )
+            logger.info("Stream type: StockDataStream (US equities)")
+
         stream.subscribe_trades(
             self._handle_trade,
             config.primary_symbol,
-            config.benchmark_symbol,
+            benchmark,
         )
         stream.subscribe_quotes(
             self._handle_quote,
             config.primary_symbol,
-            config.benchmark_symbol,
+            benchmark,
         )
         return stream
 

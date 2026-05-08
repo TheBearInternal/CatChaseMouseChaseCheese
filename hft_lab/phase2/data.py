@@ -269,6 +269,10 @@ class DataManager:
         self.slow_buffer: SlowBuffer = SlowBuffer()
         self._session_open_ts: Optional[datetime] = None
         self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
+        self._is_crypto: bool = config.is_crypto()
+        logger.info(
+            f"DataManager initialised | mode={'CRYPTO (24/7 rolling VWAP)' if self._is_crypto else 'EQUITY (session VWAP)'}"
+        )
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -322,18 +326,35 @@ class DataManager:
         Returns:
             ``True`` when ``is_ready`` is satisfied after loading.
         """
-        from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
         def _fetch() -> Any:
             start = datetime.now(timezone.utc) - timedelta(days=4)
-            request = StockBarsRequest(
-                symbol_or_symbols=[symbol, benchmark_symbol],
-                timeframe=TimeFrame.Minute,
-                start=start,
-                limit=n_bars,
-            )
-            return alpaca_client.get_stock_bars(request)
+            if config.is_crypto():
+                from alpaca.data.historical import CryptoHistoricalDataClient
+                from alpaca.data.requests import CryptoBarsRequest
+                client = CryptoHistoricalDataClient()  # no auth required
+                request = CryptoBarsRequest(
+                    symbol_or_symbols=[symbol, benchmark_symbol],
+                    timeframe=TimeFrame.Minute,
+                    start=start,
+                    limit=n_bars,
+                )
+                return client.get_crypto_bars(request)
+            else:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockBarsRequest
+                client = StockHistoricalDataClient(
+                    api_key=config.alpaca_api_key,
+                    secret_key=config.alpaca_secret_key,
+                )
+                request = StockBarsRequest(
+                    symbol_or_symbols=[symbol, benchmark_symbol],
+                    timeframe=TimeFrame.Minute,
+                    start=start,
+                    limit=n_bars,
+                )
+                return client.get_stock_bars(request)
 
         try:
             loop = asyncio.get_running_loop()
@@ -419,7 +440,10 @@ class DataManager:
     # ------------------------------------------------------------------
 
     def compute_vwap(self) -> Optional[float]:
-        """Return cumulative intraday VWAP from session open using FastBuffer data.
+        """Return VWAP from tick data.
+
+        For equity: cumulative from session open (resets daily at 09:30 EST).
+        For crypto: rolling 24-hour window regardless of time.
 
         Returns:
             VWAP as float, or ``None`` if insufficient data.
@@ -427,6 +451,14 @@ class DataManager:
         df = self.fast_primary.to_dataframe()
         if df.empty or "price" not in df.columns or "volume" not in df.columns:
             return None
+
+        if "timestamp" in df.columns:
+            if self._is_crypto:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                df = df[df["timestamp"] >= cutoff]
+            elif self._session_open_ts is not None:
+                df = df[df["timestamp"] >= self._session_open_ts]
+
         valid = df.dropna(subset=["price", "volume"])
         if valid.empty:
             return None

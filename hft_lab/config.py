@@ -56,6 +56,9 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "ATR_PERIOD",
     "ATR_STOP_MULTIPLIER",
     "RISK_REWARD_RATIO",
+    # Phase 6 keys
+    "MARKET_TYPE",
+    "CRYPTO_BENCHMARK",
 )
 
 
@@ -172,6 +175,9 @@ class Config:
     atr_period: int
     atr_stop_multiplier: float
     risk_reward_ratio: float
+    # Phase 6 fields
+    market_type: str
+    crypto_benchmark: str
 
     def is_live(self) -> bool:
         """Return ``True`` when connected to the live (real-money) Alpaca endpoint.
@@ -184,6 +190,17 @@ class Config:
             ``True`` if ``alpaca_base_url`` matches the live trading URL.
         """
         return self.alpaca_base_url.rstrip("/") == LIVE_BASE_URL.rstrip("/")
+
+    def is_crypto(self) -> bool:
+        """Return ``True`` when the engine is configured for cryptocurrency markets.
+
+        Crypto mode enables 24/7 trading via Alpaca's crypto data feed, disables
+        equity market-hours logic, and switches to rolling-window VWAP.
+
+        Returns:
+            ``True`` when ``market_type`` is ``"crypto"``.
+        """
+        return self.market_type.lower() == "crypto"
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +224,13 @@ def _load_config() -> Config:
     # generic KeyError or ValueError.
     for key in REQUIRED_KEYS:
         _require_env(key)
+
+    # Validate MARKET_TYPE is a recognised value
+    market_type_raw = _require_env("MARKET_TYPE").lower()
+    if market_type_raw not in ("equity", "crypto"):
+        raise ConfigurationError(
+            f"MARKET_TYPE must be 'equity' or 'crypto', got: {market_type_raw!r}"
+        )
 
     return Config(
         alpaca_api_key=_require_env("ALPACA_API_KEY"),
@@ -245,6 +269,9 @@ def _load_config() -> Config:
         atr_period=int(_require_env("ATR_PERIOD")),
         atr_stop_multiplier=float(_require_env("ATR_STOP_MULTIPLIER")),
         risk_reward_ratio=float(_require_env("RISK_REWARD_RATIO")),
+        # Phase 6
+        market_type=market_type_raw,
+        crypto_benchmark=_require_env("CRYPTO_BENCHMARK"),
     )
 
 

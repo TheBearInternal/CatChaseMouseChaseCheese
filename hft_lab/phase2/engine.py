@@ -238,9 +238,12 @@ async def _main() -> None:
         shutdown_event.wait(), name="shutdown-watcher"
     )
 
+    active_benchmark = (
+        config.crypto_benchmark if config.is_crypto() else config.benchmark_symbol
+    )
     logger.info(
-        f"Engine running | symbol={config.primary_symbol} "
-        f"benchmark={config.benchmark_symbol} "
+        f"Engine running | market={'CRYPTO' if config.is_crypto() else 'EQUITY'} "
+        f"symbol={config.primary_symbol} benchmark={active_benchmark} "
         f"live={config.is_live()} dev={config.dev_mode}"
     )
 

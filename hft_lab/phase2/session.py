@@ -64,11 +64,15 @@ class MarketCalendar:
     def is_market_open(self) -> bool:
         """Return True if the current moment falls within regular market hours.
 
-        Excludes weekends.  Does not account for exchange holidays.
+        Crypto markets trade 24/7 and always return True.  Equity markets are
+        open Monday–Friday 09:30–16:00 EST; weekends and exchange holidays are
+        excluded.
 
         Returns:
-            ``True`` between 09:30 and 16:00 EST on Monday–Friday.
+            ``True`` when trading is active for the configured market type.
         """
+        if config.is_crypto():
+            return True
         now = datetime.now(EST)
         if now.weekday() >= 5:  # Saturday=5, Sunday=6
             return False
@@ -78,11 +82,14 @@ class MarketCalendar:
     def time_to_open(self) -> float:
         """Return seconds until the next market open.
 
-        If the market is already open, returns 0.
+        For crypto markets always returns 0 (market never closes).
+        For equity, returns seconds until the next 09:30 EST weekday open.
 
         Returns:
             Seconds as float.
         """
+        if config.is_crypto():
+            return 0.0
         now = datetime.now(EST)
         # Find next 09:30 on a weekday
         candidate = now.replace(
@@ -196,6 +203,7 @@ class SessionManager:
         self._historical_client = historical_client
         self._stop_event: asyncio.Event = asyncio.Event()
         self._in_pre_close: bool = False
+        self._last_state_save_ts: float = 0.0  # tracks rolling 24h saves in crypto mode
 
     def stop(self) -> None:
         """Signal the session loop to exit after the current iteration."""
@@ -235,7 +243,9 @@ class SessionManager:
             while (self._calendar.is_market_open() or config.dev_mode) \
                     and not self._stop_event.is_set():
 
-                if not self._in_pre_close \
+                # Approaching-close wind-down is equity-only; crypto has no close.
+                if not config.is_crypto() \
+                        and not self._in_pre_close \
                         and self._calendar.is_approaching_close() \
                         and not config.dev_mode:
                     await self._pre_close()
@@ -251,6 +261,11 @@ class SessionManager:
                     )
                     await asyncio.sleep(ERROR_BACKOFF_S)
 
+                # Rolling 24-hour state persistence for crypto (no session close).
+                if config.is_crypto() and time.time() - self._last_state_save_ts >= 86400:
+                    await self._save_state()
+                    self._last_state_save_ts = time.time()
+
                 await asyncio.sleep(TICK_INTERVAL_S)
 
             # --- Session close ---
@@ -264,7 +279,13 @@ class SessionManager:
 
     async def _session_start(self) -> None:
         """Initialise state at the beginning of a trading session."""
-        logger.info("=== Session starting ===")
+        if config.is_crypto():
+            logger.info(
+                "=== Session starting (24/7 CRYPTO MODE — no market-hours logic, "
+                "no session close, state saved every 24h) ==="
+            )
+        else:
+            logger.info("=== Session starting ===")
         self._in_pre_close = False
         self._trade_logger.reset_session_pnl()
 
@@ -274,11 +295,16 @@ class SessionManager:
         if weights_state:
             self._kalman.load_state(weights_state)
 
+        # Select the correct benchmark symbol for the active market type
+        benchmark = (
+            config.crypto_benchmark if config.is_crypto() else config.benchmark_symbol
+        )
+
         # Warm up data buffers from historical API
         warmed = await self._dm.warm_up(
             self._historical_client,
             config.primary_symbol,
-            config.benchmark_symbol,
+            benchmark,
             config.historical_bars,
         )
         if not warmed:
@@ -304,18 +330,22 @@ class SessionManager:
         await self._executor.close_all_positions("session_close")
 
     async def _session_close(self) -> None:
-        """Flatten remaining positions and persist session state."""
+        """Flatten remaining positions (equity only) and persist session state."""
         logger.info("=== Session closing ===")
-        if not self._in_pre_close:
+        # Crypto has no scheduled session close; positions are managed by the engine
+        # shutdown handler.  Only equity flattens on calendar close.
+        if not config.is_crypto() and not self._in_pre_close:
             await self._executor.close_all_positions("session_close")
 
         session_pnl = self._trade_logger.get_session_pnl()
         logger.info(f"Session PnL — gross (approximate): ${session_pnl:.2f}")
+        await self._save_state()
 
-        # Persist state for next session
+    async def _save_state(self) -> None:
+        """Persist Kalman weights and session metrics to SlowBuffer."""
         self._dm.slow_buffer.data.update({
             "session_date": datetime.now(timezone.utc).isoformat(),
-            "session_pnl": session_pnl,
+            "session_pnl": self._trade_logger.get_session_pnl(),
             "signal_weights": self._kalman.save_state(),
             "trade_count": self._dm.slow_buffer.data.get("trade_count", 0),
         })
