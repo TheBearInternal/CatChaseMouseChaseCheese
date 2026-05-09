@@ -38,6 +38,7 @@ SHOCK_VOLATILITY_MULTIPLIER: float = 2.0
 MIN_BARS_NORMAL: int = 50
 MIN_BARS_DEV: int = 30
 RS_LOOKBACK_TICKS: int = 20
+TICK_HISTORY_MAXLEN: int = 100   # rolling window for Lee-Ready tick-rule proxy
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +270,8 @@ class DataManager:
         self.slow_buffer: SlowBuffer = SlowBuffer()
         self._session_open_ts: Optional[datetime] = None
         self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
+        self._tick_history: deque[tuple[float, int]] = deque(maxlen=TICK_HISTORY_MAXLEN)
+        self._last_tick_price: Optional[float] = None
         self._is_crypto: bool = config.is_crypto()
         self._is_forex: bool = config.is_forex()
         self._vwap_proxy_logged: bool = False  # log forex tick-volume note once
@@ -286,6 +289,10 @@ class DataManager:
     async def ingest_tick(self, symbol: str, tick_data: Dict[str, Any]) -> None:
         """Route an incoming tick to the appropriate FastBuffer.
 
+        For the primary symbol, also records a Lee-Ready tick direction into
+        ``_tick_history`` as a ``(price, direction)`` tuple where direction is
+        ``+1`` (uptick), ``-1`` (downtick), or ``0`` (no change).
+
         Args:
             symbol:    Symbol string matching PRIMARY_SYMBOL or BENCHMARK_SYMBOL.
             tick_data: Dict with tick fields (price, bid, ask, etc.).
@@ -294,6 +301,20 @@ class DataManager:
             self.fast_primary.append(tick_data)
             if self._session_open_ts is None:
                 self._session_open_ts = datetime.now(timezone.utc)
+
+            price: Optional[float] = tick_data.get("price")
+            if price is not None:
+                if self._last_tick_price is None:
+                    direction = 0
+                elif price > self._last_tick_price:
+                    direction = 1
+                elif price < self._last_tick_price:
+                    direction = -1
+                else:
+                    direction = 0
+                self._tick_history.append((float(price), direction))
+                self._last_tick_price = float(price)
+
         elif symbol == config.benchmark_symbol:
             self.fast_benchmark.append(tick_data)
 

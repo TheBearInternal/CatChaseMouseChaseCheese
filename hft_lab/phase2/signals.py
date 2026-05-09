@@ -11,7 +11,7 @@ MACDSignal            : MACD histogram normalized via tanh.
 RSISignal             : RSI(14) normalized to [-1, +1] with exhaustion damping.
 BollingerSignal       : %B mean-reversion score, polarity inverts in trends.
 VWAPSignal            : Intraday VWAP deviation via tanh, polarity inverts in trends.
-OrderBookSignal       : Bid/ask size imbalance.
+OrderBookSignal       : Bid/ask size imbalance (L2) or Lee-Ready tick-rule proxy.
 RelativeStrengthSignal: Asset return minus benchmark return via tanh.
 
 ``SignalEngine`` runs all six and returns a dict of scores.
@@ -244,8 +244,23 @@ class VWAPSignal:
 # ---------------------------------------------------------------------------
 
 
+TICK_RULE_WINDOW: int = 50    # number of recent tick directions to sum
+TICK_RULE_NORMALIZER: float = float(TICK_RULE_WINDOW)
+
+
 class OrderBookSignal:
-    """Bid/ask size imbalance directly as a score in [-1, +1]."""
+    """Bid/ask size imbalance with Lee-Ready tick-rule fallback.
+
+    When Level 2 book depth is available (bid_size > 0 and ask_size > 0),
+    the standard imbalance formula is used::
+
+        score = (bid_size - ask_size) / (bid_size + ask_size)
+
+    On free data feeds where bid_size and ask_size are always 0, the signal
+    falls back to a tick-rule proxy: the sum of the last 50 tick directions
+    (+1 uptick / -1 downtick / 0 no change) divided by 50.  This gives a
+    genuine volume-flow pressure reading from trade prints alone.
+    """
 
     def __init__(self, data_manager: DataManager) -> None:
         """Initialise with a reference to the shared DataManager.
@@ -254,31 +269,41 @@ class OrderBookSignal:
             data_manager: Shared DataManager instance.
         """
         self._dm = data_manager
+        self._tick_rule_logged: bool = False
 
     def compute(self, regime_state: Optional[object] = None) -> float:
         """Compute and return the order book imbalance score.
 
-        Imbalance = (bid_size - ask_size) / (bid_size + ask_size).
-        Positive → buy-side pressure (bullish), negative → sell-side pressure.
+        Tries Level 2 bid/ask sizes first.  Falls back to the Lee-Ready
+        tick-rule proxy when L2 data is unavailable.
 
         Args:
             regime_state: Unused; present for uniform interface.
 
         Returns:
-            Float in [-1.0, +1.0], or 0.0 if sizes are unavailable or zero.
+            Float in [-1.0, +1.0], or 0.0 if no tick history exists yet.
         """
         df = self._dm.fast_primary.to_dataframe()
-        if df.empty or "bid_size" not in df.columns or "ask_size" not in df.columns:
+        if not df.empty and "bid_size" in df.columns and "ask_size" in df.columns:
+            latest = df.dropna(subset=["bid_size", "ask_size"]).tail(1)
+            if not latest.empty:
+                bid_sz = float(latest["bid_size"].iloc[-1])
+                ask_sz = float(latest["ask_size"].iloc[-1])
+                total = bid_sz + ask_sz
+                if total >= 1e-8:
+                    return float(np.clip((bid_sz - ask_sz) / total, -1.0, 1.0))
+
+        # L2 data unavailable — use tick-rule proxy
+        if not self._tick_rule_logged:
+            logger.debug("OrderBook | using tick-rule proxy (no L2 data)")
+            self._tick_rule_logged = True
+
+        history = self._dm._tick_history
+        if not history:
             return 0.0
-        latest = df.dropna(subset=["bid_size", "ask_size"]).tail(1)
-        if latest.empty:
-            return 0.0
-        bid_sz = float(latest["bid_size"].iloc[-1])
-        ask_sz = float(latest["ask_size"].iloc[-1])
-        total = bid_sz + ask_sz
-        if total < 1e-8:
-            return 0.0
-        return float(np.clip((bid_sz - ask_sz) / total, -1.0, 1.0))
+        recent = list(history)[-TICK_RULE_WINDOW:]
+        direction_sum = sum(d for _, d in recent)
+        return float(np.clip(direction_sum / TICK_RULE_NORMALIZER, -1.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
