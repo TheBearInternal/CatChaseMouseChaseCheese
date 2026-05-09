@@ -409,7 +409,9 @@ class SessionManager:
         threshold_mult = self._event_calendar.get_threshold_multiplier()
         now_ts = time.time()
         if now_ts - self._last_calendar_log_ts >= 900:
-            logger.info(f"CALENDAR | {self._event_calendar.next_event_summary()}")
+            upcoming = self._event_calendar.get_upcoming_events(hours_ahead=24)
+            if upcoming:
+                logger.info(f"CALENDAR | {self._event_calendar.next_event_summary()}")
             self._last_calendar_log_ts = now_ts
         if in_event_window and event is not None:
             logger.debug(

@@ -114,6 +114,8 @@ def _configure_root_logger() -> None:
         "httpcore", "httpcore.connection", "httpcore.http11",
         "httpx", "huggingface_hub", "huggingface_hub.utils._http",
         "filelock", "urllib3.connectionpool",
+        "websockets", "websockets.client",
+        "alpaca.data.live.websocket",
     ]:
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 

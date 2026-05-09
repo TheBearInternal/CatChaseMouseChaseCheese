@@ -182,7 +182,8 @@ class GARCHSizer:
         if current_price < 1e-6:
             return config.min_position_size
 
-        base_risk = account_equity * max_risk_pct
+        effective_equity = min(account_equity, config.account_limit)
+        base_risk = effective_equity * max_risk_pct
         vol = self.forecast_volatility()
         volatility_scalar = 1.0 / (1.0 + vol * 100.0)
         confidence_scalar = min(confidence / config.ensemble_threshold, CONFIDENCE_SCALAR_MAX)
@@ -197,7 +198,8 @@ class GARCHSizer:
         # Apply behavioral randomization
         candidate = randomize_quantity(candidate, variance_pct=profile_variance)
         logger.debug(
-            f"PositionSize: equity={account_equity:.0f} vol={vol:.4f} "
+            f"PositionSize: equity={effective_equity:.0f} "
+            f"(capped from {account_equity:.0f}) vol={vol:.4f} "
             f"conf={confidence:.3f} → {candidate} shares"
         )
         return candidate

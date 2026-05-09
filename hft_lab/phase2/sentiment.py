@@ -279,6 +279,7 @@ class SentimentAnalyzer:
         self._last_updated: Optional[datetime] = None
         self._stop_event: asyncio.Event = asyncio.Event()
         self._calendar: EventCalendar = EventCalendar(silent=True)
+        self._seen_headlines: set[str] = set()
 
     # ------------------------------------------------------------------
     # Properties
@@ -368,11 +369,13 @@ class SentimentAnalyzer:
             for headline in headlines:
                 score = _score_headline(headline)
                 self._update_ema(score)
-                logger.info(
-                    f"Sentiment [{backend}|NewsAPI] | "
-                    f"score={score:+.3f} ema={self._news_score:+.3f} | "
-                    f"{headline[:80]}"
-                )
+                if headline not in self._seen_headlines:
+                    logger.info(
+                        f"Sentiment [{backend}|NewsAPI] | "
+                        f"score={score:+.3f} ema={self._news_score:+.3f} | "
+                        f"{headline[:80]}"
+                    )
+                    self._seen_headlines.add(headline)
 
             self._last_updated = datetime.now(timezone.utc)
 
