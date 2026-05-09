@@ -109,6 +109,14 @@ def _configure_root_logger() -> None:
     logging.getLogger('PIL').setLevel(logging.WARNING)
     logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
 
+    # Suppress FinBERT/HuggingFace HTTP noise
+    for _noisy in [
+        "httpcore", "httpcore.connection", "httpcore.http11",
+        "httpx", "huggingface_hub", "huggingface_hub.utils._http",
+        "filelock", "urllib3.connectionpool",
+    ]:
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     _root_configured = True
 
 

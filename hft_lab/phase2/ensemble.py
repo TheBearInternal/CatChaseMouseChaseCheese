@@ -348,6 +348,10 @@ class EnsembleDecision:
                     maximization — no signal is trusted in random walk).
     """
 
+    def __init__(self) -> None:
+        self._prev_raw: float = 0.0
+        self._prev_action: str = ""
+
     def decide(
         self,
         signal_scores: Dict[str, float],
@@ -402,11 +406,14 @@ class EnsembleDecision:
             weights_used=adjusted,
             raw_score=raw_score,
         )
-        logger.debug(
-            f"Ensemble | regime={regime.value} raw={raw_score:+.4f} "
-            f"sentiment={sentiment:+.3f} modified={modified_score:+.4f} "
-            f"threshold={threshold:.2f} → {action} (conf={confidence:.4f})"
-        )
+        if abs(raw_score - self._prev_raw) > 0.001 or action != self._prev_action:
+            logger.debug(
+                f"Ensemble | regime={regime.value} raw={raw_score:+.4f} "
+                f"sentiment={sentiment:+.3f} modified={modified_score:+.4f} "
+                f"threshold={threshold:.2f} → {action} (conf={confidence:.4f})"
+            )
+            self._prev_raw = raw_score
+            self._prev_action = action
         return decision
 
     @staticmethod

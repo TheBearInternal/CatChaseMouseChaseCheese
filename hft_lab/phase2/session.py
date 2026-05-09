@@ -231,6 +231,7 @@ class SessionManager:
         self._last_state_save_ts: float = 0.0
         self._event_calendar: EventCalendar = EventCalendar(silent=False)
         self._last_calendar_log_ts: float = 0.0
+        self._last_summary_ts: float = 0.0
 
     def stop(self) -> None:
         """Signal the session loop to exit after the current iteration."""
@@ -446,6 +447,22 @@ class SessionManager:
         # 9. Periodic GARCH re-fit
         if self._garch.should_refit:
             await self._fit_garch()
+
+        # 10. 15-second heartbeat — replaces per-tick noise with a readable summary
+        if now_ts - self._last_summary_ts >= 15:
+            regime_thresholds = {
+                "RANDOM_WALK": config.ensemble_threshold_random,
+                "AMBIGUOUS": config.ensemble_threshold_ambiguous,
+            }
+            threshold = regime_thresholds.get(regime.value, config.ensemble_threshold)
+            logger.info(
+                f"Status | regime={regime.value} "
+                f"conf={decision.confidence:.4f} "
+                f"sentiment={sentiment:+.3f} "
+                f"positions={len(self._executor.open_positions)} "
+                f"threshold={threshold:.2f}"
+            )
+            self._last_summary_ts = now_ts
 
     async def _handle_signal(
         self,

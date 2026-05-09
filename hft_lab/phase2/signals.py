@@ -370,6 +370,7 @@ class SignalEngine:
         self._vwap = VWAPSignal(data_manager)
         self._order_book = OrderBookSignal(data_manager)
         self._rs = RelativeStrengthSignal(data_manager)
+        self._prev_scores: Dict[str, float] = {}
 
     def compute_all(self, regime_state: Optional[object] = None) -> Dict[str, float]:
         """Compute all six signal scores and return them as a named dict.
@@ -384,15 +385,20 @@ class SignalEngine:
             Dict mapping signal name to score in [-1.0, +1.0].
         """
         scores: Dict[str, float] = {
-            "macd":             self._macd.compute(regime_state),
-            "rsi":              self._rsi.compute(regime_state),
-            "bollinger":        self._bollinger.compute(regime_state),
-            "vwap":             self._vwap.compute(regime_state),
-            "order_book":       self._order_book.compute(regime_state),
+            "macd":              self._macd.compute(regime_state),
+            "rsi":               self._rsi.compute(regime_state),
+            "bollinger":         self._bollinger.compute(regime_state),
+            "vwap":              self._vwap.compute(regime_state),
+            "order_book":        self._order_book.compute(regime_state),
             "relative_strength": self._rs.compute(regime_state),
         }
-        logger.debug(
-            "Signal scores | " +
-            " ".join(f"{k}={v:+.3f}" for k, v in scores.items())
-        )
+        if any(
+            abs(scores[k] - self._prev_scores.get(k, -999.0)) > 0.001
+            for k in scores
+        ):
+            logger.debug(
+                "Signal scores | " +
+                " ".join(f"{k}={v:+.3f}" for k, v in scores.items())
+            )
+            self._prev_scores = scores.copy()
         return scores
