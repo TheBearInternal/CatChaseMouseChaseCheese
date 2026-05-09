@@ -51,7 +51,9 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "NEWS_POLL_INTERVAL",
     "KALMAN_PROCESS_NOISE",
     "KALMAN_MEASUREMENT_NOISE",
-    "IC_WINDOW",
+    "IC_WINDOW_EQUITY",
+    "IC_WINDOW_CRYPTO",
+    "IC_WINDOW_FOREX",
     "GARCH_UPDATE_INTERVAL",
     "ATR_PERIOD",
     "ATR_STOP_MULTIPLIER",
@@ -176,7 +178,9 @@ class Config:
     news_poll_interval: int
     kalman_process_noise: float
     kalman_measurement_noise: float
-    ic_window: int
+    ic_window_equity: int
+    ic_window_crypto: int
+    ic_window_forex: int
     garch_update_interval: int
     atr_period: int
     atr_stop_multiplier: float
@@ -290,7 +294,9 @@ def _load_config() -> Config:
         news_poll_interval=int(_require_env("NEWS_POLL_INTERVAL")),
         kalman_process_noise=float(_require_env("KALMAN_PROCESS_NOISE")),
         kalman_measurement_noise=float(_require_env("KALMAN_MEASUREMENT_NOISE")),
-        ic_window=int(_require_env("IC_WINDOW")),
+        ic_window_equity=int(_require_env("IC_WINDOW_EQUITY")),
+        ic_window_crypto=int(_require_env("IC_WINDOW_CRYPTO")),
+        ic_window_forex=int(_require_env("IC_WINDOW_FOREX")),
         garch_update_interval=int(_require_env("GARCH_UPDATE_INTERVAL")),
         atr_period=int(_require_env("ATR_PERIOD")),
         atr_stop_multiplier=float(_require_env("ATR_STOP_MULTIPLIER")),

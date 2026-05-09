@@ -80,9 +80,19 @@ class InformationCoefficient:
     """
 
     def __init__(self) -> None:
+        if config.is_crypto():
+            ic_window = config.ic_window_crypto
+        elif config.is_forex():
+            ic_window = config.ic_window_forex
+        else:
+            ic_window = config.ic_window_equity
         self._history: Dict[str, deque[Tuple[float, float]]] = {
-            name: deque(maxlen=config.ic_window) for name in SIGNAL_NAMES
+            name: deque(maxlen=ic_window) for name in SIGNAL_NAMES
         }
+        logger.debug(
+            f"InformationCoefficient | window={ic_window} "
+            f"market={config.market_type}"
+        )
 
     def update(self, signal_name: str, prediction: float, actual_return: float) -> None:
         """Record one (prediction, outcome) pair for a signal.
