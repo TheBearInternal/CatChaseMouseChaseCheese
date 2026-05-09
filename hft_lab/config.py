@@ -161,7 +161,7 @@ class Config:
     max_risk_per_trade_pct: float
     position_mode: str
     fixed_position_size: int
-    min_position_size: int
+    min_position_size: float
     spread_adjustment_enabled: bool
     slippage_factor: float
     min_profit_spread_multiple: float
@@ -275,7 +275,7 @@ def _load_config() -> Config:
         max_risk_per_trade_pct=float(_require_env("MAX_RISK_PER_TRADE_PCT")),
         position_mode=_require_env("POSITION_MODE"),
         fixed_position_size=int(_require_env("FIXED_POSITION_SIZE")),
-        min_position_size=int(_require_env("MIN_POSITION_SIZE")),
+        min_position_size=float(_require_env("MIN_POSITION_SIZE")),
         spread_adjustment_enabled=_parse_bool(
             _require_env("SPREAD_ADJUSTMENT_ENABLED"), "SPREAD_ADJUSTMENT_ENABLED"
         ),
