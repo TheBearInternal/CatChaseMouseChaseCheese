@@ -425,8 +425,8 @@ class SessionManager:
         # 4. News sentiment
         sentiment = self._sentiment.current_sentiment
 
-        # 5. Kalman weights
-        weights = self._kalman.get_weights()
+        # 5. Kalman weights for this regime's vector
+        weights = self._kalman.get_weights(regime)
 
         # 6. Ensemble decision
         decision = self._ensemble.decide(signal_scores, weights, regime, sentiment)
@@ -441,7 +441,7 @@ class SessionManager:
         # 8. Check existing positions for fills and exits
         closed_trades = await self._executor.check_positions()
         for trade in closed_trades:
-            await self._on_trade_closed(trade, signal_scores)
+            await self._on_trade_closed(trade, signal_scores, regime)
 
         # 9. Periodic GARCH re-fit
         if self._garch.should_refit:
@@ -471,7 +471,6 @@ class SessionManager:
             threshold_mult: Confidence-threshold multiplier from EventCalendar (≥1.0).
         """
         # Calendar-adjusted confidence threshold gate
-        from phase2.ensemble import RegimeState as _RS
         regime_thresholds = {
             "RANDOM_WALK": config.ensemble_threshold_random,
             "AMBIGUOUS": config.ensemble_threshold_ambiguous,
@@ -547,13 +546,20 @@ class SessionManager:
         )
 
     async def _on_trade_closed(
-        self, trade: Any, current_signal_scores: Dict[str, float]
+        self,
+        trade: Any,
+        current_signal_scores: Dict[str, float],
+        regime: RegimeState,
     ) -> None:
         """Update IC and run Kalman correction after a position closes.
 
+        The Kalman update targets only *regime*'s weight vector so each
+        regime accumulates its own signal performance history.
+
         Args:
-            trade:                Closed TradeRecord.
+            trade:                 Closed TradeRecord.
             current_signal_scores: Signal scores at the time of closure check.
+            regime:                RegimeState active when the position closed.
         """
         if trade.entry_price < 1e-6:
             return
@@ -567,9 +573,9 @@ class SessionManager:
             pred = trade.signal_scores_at_entry.get(name, 0.0)
             self._ic.update(name, pred, actual_return)
 
-        # Kalman correction step
+        # Kalman correction step — update only this regime's weight vector
         ic_vector = np.array([self._ic.get_ic(n) for n in SIGNAL_NAMES])
-        self._kalman.update(ic_vector)
+        self._kalman.update(ic_vector, regime)
 
         logger.info(
             f"Trade closed: {trade.side} {trade.symbol} "

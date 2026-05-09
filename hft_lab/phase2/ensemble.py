@@ -4,8 +4,10 @@ Components
 ----------
 InformationCoefficient : Rolling Pearson correlation of signal predictions vs
                          actual outcomes, per signal, windowed to IC_WINDOW.
-KalmanEnsemble         : Tracks a 6-element weight vector via a Kalman random-walk
-                         model, updating when new IC observations arrive.
+KalmanEnsemble         : Maintains four independent Kalman weight vectors —
+                         one per RegimeState — so each regime accumulates its
+                         own signal performance history without cross-regime
+                         dilution.
 EnsembleDecision       : Combines weighted signal scores, regime-based weight
                          priors, and news sentiment to produce a final trading
                          decision with a configurable confidence threshold.
@@ -132,96 +134,192 @@ class InformationCoefficient:
 
 
 class KalmanEnsemble:
-    """Tracks signal weight vector via a Kalman random-walk filter.
+    """Four independent Kalman weight vectors — one per RegimeState.
 
-    State model
-    -----------
+    State model (per regime)
+    ------------------------
     State transition : w_t = w_{t-1} + process_noise    (random walk)
     Observation      : z_t = H w_t + measurement_noise  (H = identity)
 
-    The weight vector is updated whenever a new IC observation is available
-    (after a trade closes and InformationCoefficient is updated).
+    Each regime's vector is updated only when a trade closes in that regime,
+    so TRENDING weights learn only from trending-market outcomes, and so on.
+    Switching the active regime logs at DEBUG so operators can trace which
+    vector is driving decisions at any moment.
     """
 
+    _REGIME_SAVE_KEY: Dict[RegimeState, str] = {
+        RegimeState.TRENDING: "trending",
+        RegimeState.MEAN_REVERTING: "mean_reverting",
+        RegimeState.RANDOM_WALK: "random_walk",
+        RegimeState.AMBIGUOUS: "ambiguous",
+    }
+
     def __init__(self) -> None:
-        self._w: np.ndarray = np.full(N_SIGNALS, INITIAL_WEIGHT)
-        self._P: np.ndarray = np.eye(N_SIGNALS) * INITIAL_COV_SCALE
+        self._weights: Dict[RegimeState, np.ndarray] = {
+            r: np.full(N_SIGNALS, INITIAL_WEIGHT) for r in RegimeState
+        }
+        self._covariance: Dict[RegimeState, np.ndarray] = {
+            r: np.eye(N_SIGNALS) * INITIAL_COV_SCALE for r in RegimeState
+        }
         self._Q: np.ndarray = np.eye(N_SIGNALS) * config.kalman_process_noise
         self._R: float = config.kalman_measurement_noise
+        self._active_regime: Optional[RegimeState] = None
 
-    def predict(self) -> None:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_log_switch(self, regime: RegimeState) -> None:
+        """Log at DEBUG whenever the active regime vector changes."""
+        if regime == self._active_regime:
+            return
+        w = self._weights[regime]
+        w_pos = np.maximum(w, MIN_WEIGHT_FLOOR)
+        w_norm = w_pos / w_pos.sum()
+        w_str = "[" + " ".join(f"{v:.4f}" for v in w_norm) + "]"
+        logger.debug(
+            f"Kalman | switching to {regime.value} weights | w={w_str}"
+        )
+        self._active_regime = regime
+
+    # ------------------------------------------------------------------
+    # Kalman steps
+    # ------------------------------------------------------------------
+
+    def predict(self, regime: Optional[RegimeState] = None) -> None:
         """Kalman prediction step: advance covariance by process noise.
 
-        Called once per trading session or periodically to allow weight
-        uncertainty to grow before the next update.
+        Args:
+            regime: Regime whose covariance to advance.  Pass ``None`` (the
+                    default) to advance all four regimes — used at session open
+                    before the first regime classification runs.
         """
-        self._P = self._P + self._Q
-        logger.debug("KalmanEnsemble: prediction step applied")
+        targets = list(RegimeState) if regime is None else [regime]
+        for r in targets:
+            self._covariance[r] = self._covariance[r] + self._Q
+        label = regime.value if regime is not None else "all regimes"
+        logger.debug(f"Kalman | predict step applied to {label}")
 
-    def update(self, ic_observation_vector: np.ndarray) -> None:
-        """Kalman correction step using IC values as observations.
+    def update(self, ic_observation_vector: np.ndarray, regime: RegimeState) -> None:
+        """Kalman correction step for *regime*'s weight vector only.
 
-        Uses H = I (identity), so IC values are treated as direct noisy
-        observations of the latent signal weights.
+        Uses H = I (identity), so IC values are direct noisy observations of
+        the latent per-regime signal weights.
 
         Args:
             ic_observation_vector: 1-D array of length N_SIGNALS with current
-                                   IC values in the order of SIGNAL_NAMES.
+                                   IC values in SIGNAL_NAMES order.
+            regime: The regime whose vector to update.
         """
+        self._maybe_log_switch(regime)
+        w = self._weights[regime]
+        P = self._covariance[regime]
+
         H = np.eye(N_SIGNALS)
-        S = H @ self._P @ H.T + self._R * np.eye(N_SIGNALS)
+        S = H @ P @ H.T + self._R * np.eye(N_SIGNALS)
         try:
-            K = self._P @ H.T @ np.linalg.inv(S)
+            K = P @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            logger.warning("KalmanEnsemble: singular S matrix — skipping update")
+            logger.warning(
+                f"KalmanEnsemble: singular S matrix for {regime.value} — skipping update"
+            )
             return
-        innovation = ic_observation_vector - H @ self._w
-        self._w = self._w + K @ innovation
-        self._P = (np.eye(N_SIGNALS) - K @ H) @ self._P
+        innovation = ic_observation_vector - H @ w
+        self._weights[regime] = w + K @ innovation
+        self._covariance[regime] = (np.eye(N_SIGNALS) - K @ H) @ P
         logger.debug(
-            "KalmanEnsemble updated | weights=" +
-            " ".join(f"{SIGNAL_NAMES[i]}={self._w[i]:.4f}" for i in range(N_SIGNALS))
+            f"Kalman updated [{regime.value}] | weights=" +
+            " ".join(
+                f"{SIGNAL_NAMES[i]}={self._weights[regime][i]:.4f}"
+                for i in range(N_SIGNALS)
+            )
         )
 
-    def get_weights(self) -> Dict[str, float]:
-        """Return normalized, strictly-positive weight dict.
+    def get_weights(self, regime: RegimeState) -> Dict[str, float]:
+        """Return normalized, strictly-positive weight dict for *regime*.
 
         All raw weights are floored at ``MIN_WEIGHT_FLOOR`` then normalized
         so they sum to 1.0.
 
+        Args:
+            regime: The regime whose weight vector to use.
+
         Returns:
-            Dict mapping signal name to weight.
+            Dict mapping signal name to weight in (0, 1] summing to 1.0.
         """
-        w_pos = np.maximum(self._w, MIN_WEIGHT_FLOOR)
+        self._maybe_log_switch(regime)
+        w = self._weights[regime]
+        w_pos = np.maximum(w, MIN_WEIGHT_FLOOR)
         w_norm = w_pos / w_pos.sum()
         return {name: float(w_norm[i]) for i, name in enumerate(SIGNAL_NAMES)}
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
     def save_state(self) -> Dict[str, Any]:
-        """Serialise weight vector for SlowBuffer persistence.
+        """Serialise all four regime weight vectors for SlowBuffer persistence.
 
         Returns:
-            Dict with ``weights`` and ``covariance`` lists.
+            Dict with keys ``kalman_weights_<regime>`` and
+            ``kalman_covariance_<regime>`` for each RegimeState.
         """
-        return {
-            "weights": self._w.tolist(),
-            "covariance": self._P.tolist(),
-        }
+        state: Dict[str, Any] = {}
+        for regime, key in self._REGIME_SAVE_KEY.items():
+            state[f"kalman_weights_{key}"] = self._weights[regime].tolist()
+            state[f"kalman_covariance_{key}"] = self._covariance[regime].tolist()
+        return state
 
     def load_state(self, state: Dict[str, Any]) -> None:
-        """Restore weight vector from a previously saved SlowBuffer snapshot.
+        """Restore weight vectors from a previously saved SlowBuffer snapshot.
+
+        Handles both the current four-vector format and the legacy single-vector
+        format (``weights`` / ``covariance`` keys) by broadcasting the legacy
+        vector to all regimes so old session files are forward-compatible.
 
         Args:
-            state: Dict produced by ``save_state``.
+            state: Dict produced by ``save_state`` or its legacy predecessor.
         """
-        try:
-            w = np.array(state["weights"], dtype=float)
-            P = np.array(state["covariance"], dtype=float)
-            if w.shape == (N_SIGNALS,) and P.shape == (N_SIGNALS, N_SIGNALS):
-                self._w = w
-                self._P = P
-                logger.info("KalmanEnsemble: loaded weights from session state")
-        except Exception as exc:
-            logger.warning(f"KalmanEnsemble: could not load state — {exc}")
+        # Legacy single-vector format → broadcast to all regimes
+        if "weights" in state and "covariance" in state:
+            try:
+                w = np.array(state["weights"], dtype=float)
+                P = np.array(state["covariance"], dtype=float)
+                if w.shape == (N_SIGNALS,) and P.shape == (N_SIGNALS, N_SIGNALS):
+                    for r in RegimeState:
+                        self._weights[r] = w.copy()
+                        self._covariance[r] = P.copy()
+                    logger.info(
+                        "KalmanEnsemble: upgraded legacy single-vector state "
+                        "→ broadcast to all 4 regime vectors"
+                    )
+                    return
+            except Exception:
+                pass
+
+        # Current four-vector format
+        loaded = 0
+        for regime, key in self._REGIME_SAVE_KEY.items():
+            try:
+                w = np.array(state[f"kalman_weights_{key}"], dtype=float)
+                P = np.array(state[f"kalman_covariance_{key}"], dtype=float)
+                if w.shape == (N_SIGNALS,) and P.shape == (N_SIGNALS, N_SIGNALS):
+                    self._weights[regime] = w
+                    self._covariance[regime] = P
+                    loaded += 1
+            except Exception:
+                pass  # missing regime keeps its equal-weight default
+
+        if loaded > 0:
+            logger.info(
+                f"KalmanEnsemble: loaded {loaded}/4 regime weight vectors "
+                "from session state"
+            )
+        else:
+            logger.warning(
+                "KalmanEnsemble: no valid vectors found in state — "
+                "all regimes start at equal weights"
+            )
 
 
 # ---------------------------------------------------------------------------
