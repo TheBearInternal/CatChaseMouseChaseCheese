@@ -367,6 +367,15 @@ class OrderExecutor:
                 None, lambda: self._oanda_client.request(r)
             )
 
+            # Bug 2: set cooldown immediately after every submission attempt;
+            # cleared to 0.0 only on genuine fill + stop/TP confirmed success
+            self._last_order_attempt_ts = time.time()
+
+            # Bug 4: guard against None or non-dict response
+            if not response or not isinstance(response, dict):
+                logger.error(f"OANDA returned invalid response: {response!r}")
+                return None
+
             fill_tx = response.get("orderFillTransaction")
             if fill_tx is None:
                 # Order was queued or rejected — no position opened
@@ -378,12 +387,11 @@ class OrderExecutor:
                     f"Order id={order_id} did not result in immediate fill "
                     "— not counting as open position"
                 )
-                self._last_order_attempt_ts = 0.0
                 return None
 
             order_id = fill_tx.get("id") or f"oanda_{int(time.time())}"
 
-            # Verify stop-loss and take-profit were confirmed by OANDA
+            # Bug 1: check at top level of response (not inside fill_tx)
             has_tp = "takeProfitOrderTransaction" in response
             has_sl = "stopLossOrderTransaction" in response
             if not has_tp or not has_sl:
@@ -391,7 +399,6 @@ class OrderExecutor:
                     f"Stop/TP not confirmed by OANDA — position is unprotected | "
                     f"id={order_id} has_tp={has_tp} has_sl={has_sl}"
                 )
-                self._last_order_attempt_ts = 0.0
                 return None
 
             position = Position(
@@ -409,7 +416,7 @@ class OrderExecutor:
             )
             self._open_positions[str(order_id)] = position
             logger.info(f"OANDA order submitted: id={order_id} regime={regime_name}")
-            self._last_order_attempt_ts = 0.0  # clear cooldown on success
+            self._last_order_attempt_ts = 0.0  # clear cooldown — genuine fill confirmed
             self._last_order_time[instrument] = time.time()
 
             # Post-fill verification: compare local count to OANDA without overwriting metadata

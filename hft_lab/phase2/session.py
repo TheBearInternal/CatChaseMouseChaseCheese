@@ -588,6 +588,8 @@ class SessionManager:
             profile_variance=self._profile.order_size_variance,
         )
         quantity = max(config.min_position_size, int(quantity * risk_mult))
+        if config.is_forex():
+            quantity = max(1, round(quantity))
 
         # Compute stop and take-profit distances; derive raw ATR for order log
         stop_dist = self._atr.compute_stop_distance()
