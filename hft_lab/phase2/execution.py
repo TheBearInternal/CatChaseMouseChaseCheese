@@ -269,6 +269,27 @@ class OrderExecutor:
         except Exception as exc:
             logger.warning(f"OANDA position sync failed: {exc!r} — starting with empty state")
 
+    def _count_oanda_positions(self) -> Optional[int]:
+        """Return the number of non-zero positions OANDA currently holds, or None on error.
+
+        Used for post-fill verification without modifying _open_positions.
+        """
+        try:
+            from oandapyV20.endpoints.positions import OpenPositions
+
+            r = OpenPositions(config.oanda_account_id)
+            response: Dict[str, Any] = self._oanda_client.request(r)
+            count = sum(
+                1
+                for pos in response.get("positions", [])
+                if abs(float(pos.get("long", {}).get("units", 0))) >= 1
+                or abs(float(pos.get("short", {}).get("units", 0))) >= 1
+            )
+            return count
+        except Exception as exc:
+            logger.warning(f"OANDA position count check failed: {exc!r}")
+            return None
+
     @staticmethod
     async def _noop_async() -> None:
         pass
@@ -343,12 +364,22 @@ class OrderExecutor:
             response: Dict[str, Any] = await loop.run_in_executor(
                 None, lambda: self._oanda_client.request(r)
             )
-            # Extract the transaction ID from OANDA's response envelope
-            order_id = (
-                response.get("orderFillTransaction", {}).get("id")
-                or response.get("orderCreateTransaction", {}).get("id")
-                or f"oanda_{int(time.time())}"
-            )
+
+            fill_tx = response.get("orderFillTransaction")
+            if fill_tx is None:
+                # Order was queued or rejected — no position opened
+                order_id = (
+                    response.get("orderCreateTransaction", {}).get("id")
+                    or f"oanda_{int(time.time())}"
+                )
+                logger.warning(
+                    f"Order id={order_id} did not result in immediate fill "
+                    "— not counting as open position"
+                )
+                self._last_order_attempt_ts = 0.0
+                return None
+
+            order_id = fill_tx.get("id") or f"oanda_{int(time.time())}"
             position = Position(
                 symbol=instrument,
                 side=side,
@@ -365,6 +396,16 @@ class OrderExecutor:
             self._open_positions[str(order_id)] = position
             logger.info(f"OANDA order submitted: id={order_id} regime={regime_name}")
             self._last_order_attempt_ts = 0.0  # clear cooldown on success
+
+            # Post-fill verification: compare local count to OANDA without overwriting metadata
+            oanda_count = self._count_oanda_positions()
+            local_count = len(self._open_positions)
+            if oanda_count is not None and oanda_count != local_count:
+                logger.warning(
+                    f"Position count mismatch after fill: local={local_count}, "
+                    f"OANDA reports {oanda_count} — trusting OANDA"
+                )
+
             return position
 
         except Exception as exc:
