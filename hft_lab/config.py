@@ -192,6 +192,8 @@ class Config:
     oanda_account_id: str
     oanda_environment: str
     forex_benchmark: str
+    # Forex ATR floor
+    min_atr_forex: float
     # News strategy fields
     reddit_sentiment_enabled: bool
     reddit_client_id: str
@@ -312,6 +314,7 @@ def _load_config() -> Config:
         reddit_sentiment_enabled=_parse_bool(
             _require_env("REDDIT_SENTIMENT_ENABLED"), "REDDIT_SENTIMENT_ENABLED"
         ),
+        min_atr_forex=float(os.getenv("MIN_ATR_FOREX", "0.0005")),
         reddit_client_id=os.getenv("REDDIT_CLIENT_ID", ""),
         reddit_client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
     )

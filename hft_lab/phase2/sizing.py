@@ -252,8 +252,13 @@ class ATRSizer:
                 abs(lows[i] - closes[i - 1]),
             )
         alpha = 1.0 / config.atr_period
-        atr = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values
-        return float(atr[-1])
+        atr = float(pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values[-1])
+        if config.is_forex() and atr < config.min_atr_forex:
+            logger.warning(
+                f"ATR floored: raw={atr:.5f} → floor={config.min_atr_forex:.5f}"
+            )
+            atr = config.min_atr_forex
+        return atr
 
     def compute_stop_distance(self) -> float:
         """Return stop-loss distance = ATR_STOP_MULTIPLIER × current ATR.

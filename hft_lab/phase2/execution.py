@@ -221,6 +221,53 @@ class OrderExecutor:
                 access_token=config.oanda_api_key,
                 environment=config.oanda_environment,
             )
+            self._sync_positions_from_oanda()
+
+    def _sync_positions_from_oanda(self) -> None:
+        """Populate _open_positions from OANDA open positions on startup.
+
+        Restores position state so the session can correctly detect exits after
+        a restart without creating ghost positions or missing close events.
+        """
+        try:
+            from oandapyV20.endpoints.positions import OpenPositions
+
+            r = OpenPositions(config.oanda_account_id)
+            response: Dict[str, Any] = self._oanda_client.request(r)
+            positions = response.get("positions", [])
+            for pos in positions:
+                instrument = pos.get("instrument", "")
+                long_units = float(pos.get("long", {}).get("units", 0))
+                short_units = float(pos.get("short", {}).get("units", 0))
+                if abs(long_units) < 1 and abs(short_units) < 1:
+                    continue
+                side = "LONG" if long_units > 0 else "SHORT"
+                qty = int(abs(long_units if long_units != 0 else short_units))
+                avg_price = float(
+                    pos.get("long" if side == "LONG" else "short", {}).get(
+                        "averagePrice", 0.0
+                    )
+                )
+                synthetic_id = f"oanda_sync_{instrument}_{int(time.time())}"
+                self._open_positions[synthetic_id] = Position(
+                    symbol=instrument,
+                    side=side,
+                    entry_price=avg_price,
+                    quantity=qty,
+                    stop_price=0.0,
+                    take_profit_price=0.0,
+                    entry_time=datetime.now(timezone.utc),
+                    order_id=synthetic_id,
+                    signal_scores_at_entry={},
+                    weights_at_entry={},
+                    regime_at_entry="unknown",
+                )
+            logger.info(
+                f"Position sync | found {len(self._open_positions)} open "
+                f"position(s) from OANDA"
+            )
+        except Exception as exc:
+            logger.warning(f"OANDA position sync failed: {exc!r} — starting with empty state")
 
     @staticmethod
     async def _noop_async() -> None:

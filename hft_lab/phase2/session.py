@@ -339,6 +339,13 @@ class SessionManager:
         else:
             benchmark = config.benchmark_symbol
 
+        if config.is_forex() and config.primary_symbol == benchmark:
+            logger.warning(
+                f"primary_symbol == forex_benchmark ({config.primary_symbol}) — "
+                "relative_strength signal will be zero. "
+                "Set FOREX_BENCHMARK to a different pair."
+            )
+
         # Warm up data buffers from historical API
         warmed = await self._dm.warm_up(
             self._historical_client,
