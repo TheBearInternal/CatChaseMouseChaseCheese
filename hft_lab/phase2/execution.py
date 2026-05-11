@@ -689,7 +689,14 @@ class OrderExecutor:
                     ))
                     closed.append(oid)
                 except Exception as exc:
-                    logger.error(f"OANDA close position {oid} failed: {exc!r}")
+                    exc_str = str(exc)
+                    if "CLOSEOUT_POSITION_DOESNT_EXIST" in exc_str:
+                        logger.warning(
+                            f"Position {oid} not found on OANDA — removing from tracker"
+                        )
+                        closed.append(oid)
+                    else:
+                        logger.error(f"OANDA close position {oid} failed: {exc!r}")
             for oid in closed:
                 del self._open_positions[oid]
             return

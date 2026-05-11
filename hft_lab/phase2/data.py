@@ -243,6 +243,8 @@ class SlowBuffer:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 self.data = json.load(f)
+            # Positions are always sourced from OANDA on startup; never restore from file
+            self.data.pop("open_positions", None)
             logger.info(f"SlowBuffer loaded from {path}")
         except Exception as exc:
             logger.warning(f"Failed to load session state from {path}: {exc}")

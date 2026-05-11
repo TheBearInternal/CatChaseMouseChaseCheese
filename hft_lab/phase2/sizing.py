@@ -254,10 +254,11 @@ class ATRSizer:
         alpha = 1.0 / config.atr_period
         atr = float(pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values[-1])
         if config.is_forex() and atr < config.min_atr_forex:
-            logger.warning(
-                f"ATR floored: raw={atr:.5f} → floor={config.min_atr_forex:.5f}"
-            )
+            raw_atr = atr
             atr = config.min_atr_forex
+            logger.warning(
+                f"ATR floored | raw={raw_atr:.6f} → floor={atr:.5f} (spread protection)"
+            )
         return atr
 
     def compute_stop_distance(self) -> float:
