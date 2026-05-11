@@ -364,6 +364,13 @@ class SessionManager:
 
         # Kalman prediction step at session open
         self._kalman.predict()
+
+        # Launch the forex position monitor alongside the trading loop
+        if config.is_forex():
+            asyncio.create_task(
+                self._monitor_positions(), name="forex-position-monitor"
+            )
+
         logger.info("Session ready — trading loop active")
 
     async def _pre_close(self) -> None:
@@ -516,15 +523,28 @@ class SessionManager:
             logger.debug("Position limit reached — skipping signal")
             return
 
-        # Forex FIFO guard: one open position per symbol
+        # Forex FIFO guard: one open position per symbol; signal-reversal exit
         if config.is_forex():
             symbol = config.primary_symbol
-            already_open = any(
-                p.symbol == symbol
-                for p in self._executor._open_positions.values()
+            open_pos = next(
+                (p for p in self._executor._open_positions.values()
+                 if p.symbol == symbol),
+                None,
             )
-            if already_open:
-                logger.debug(f"FIFO | Position already open for {symbol} — skipping")
+            if open_pos is not None:
+                opposite = {"LONG": "SHORT", "SHORT": "LONG"}
+                if (decision.action == opposite.get(open_pos.side)
+                        and decision.confidence >= config.ensemble_threshold):
+                    logger.info(
+                        f"Signal reversal exit | {symbol} {open_pos.side} closed "
+                        f"— signal flipped to {decision.action} "
+                        f"conf={decision.confidence:.4f}"
+                    )
+                    await self._executor.close_position_by_symbol(
+                        symbol, reason="signal_reversal"
+                    )
+                else:
+                    logger.debug(f"FIFO | Position already open for {symbol} — skipping")
                 return
 
             # Per-symbol submission cooldown
@@ -636,6 +656,40 @@ class SessionManager:
             f"reason={trade.exit_reason} | "
             f"session_pnl={self._trade_logger.get_session_pnl():+.2f}"
         )
+
+    # ------------------------------------------------------------------
+    # Forex position monitor
+    # ------------------------------------------------------------------
+
+    async def _monitor_positions(self) -> None:
+        """Every 30 seconds, reconcile the local tracker against OANDA's live state.
+
+        If OANDA reports 0 open positions while the tracker holds 1 or more
+        (i.e. SL/TP hit or position closed externally), the tracker is cleared
+        and the event is logged so the next tick can enter fresh.
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            if not self._executor._open_positions:
+                continue
+
+            before_count = len(self._executor._open_positions)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._executor._sync_positions_from_oanda
+            )
+            after_count = len(self._executor._open_positions)
+
+            if before_count > 0 and after_count == 0:
+                logger.info(
+                    "Position monitor | OANDA reports 0 open — clearing tracker "
+                    "(TP/SL hit or externally closed)"
+                )
 
     # ------------------------------------------------------------------
     # Helpers

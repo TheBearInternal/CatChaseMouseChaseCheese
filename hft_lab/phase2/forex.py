@@ -169,26 +169,31 @@ class OANDAStreamingConnection:
         environment: str,
         instruments: List[str],
         data_manager: Any,
+        order_executor: Optional[Any] = None,
     ) -> None:
         """Initialise the streaming connection.
 
         Args:
-            api_key:      OANDA personal access token.  Never logged or printed.
-            account_id:   V20 account ID.
-            environment:  ``"live"`` or ``"practice"``.
-            instruments:  OANDA instrument strings to subscribe, e.g.
-                          ``["EUR_USD", "GBP_USD"]``.
-            data_manager: :class:`~phase2.data.DataManager` that receives ticks.
+            api_key:        OANDA personal access token.  Never logged or printed.
+            account_id:     V20 account ID.
+            environment:    ``"live"`` or ``"practice"``.
+            instruments:    OANDA instrument strings to subscribe, e.g.
+                            ``["EUR_USD", "GBP_USD"]``.
+            data_manager:   :class:`~phase2.data.DataManager` that receives ticks.
+            order_executor: Optional :class:`~phase2.execution.OrderExecutor`;
+                            when set, position state is synced from OANDA after
+                            each successful reconnect.
         """
         self._api_key: str = api_key
         self._account_id: str = account_id
         self._environment: str = environment
         self._instruments: List[str] = instruments
         self._dm: Any = data_manager
+        self._order_executor: Optional[Any] = order_executor
         self._connected: bool = False
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self._last_message_ts: float = 0.0
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
+        self._thread_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="oanda-stream"
         )
 
@@ -337,8 +342,16 @@ class OANDAStreamingConnection:
                         f"instruments={self._instruments}"
                     )
                     self._connected = True
+
+                    # On reconnect, sync positions before resuming the stream
+                    if attempt > 0 and self._order_executor is not None:
+                        logger.info("Stream reconnect — syncing positions from OANDA")
+                        await loop.run_in_executor(
+                            None, self._order_executor._sync_positions_from_oanda
+                        )
+
                     await loop.run_in_executor(
-                        self._executor,
+                        self._thread_executor,
                         lambda: self._stream_sync(loop),
                     )
 
@@ -384,5 +397,5 @@ class OANDAStreamingConnection:
         logger.info("FOREX stream shutdown initiated")
         self._shutdown_event.set()
         self._connected = False
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._thread_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("FOREX stream shutdown complete")

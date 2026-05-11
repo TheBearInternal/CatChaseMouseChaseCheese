@@ -236,6 +236,7 @@ class OrderExecutor:
             r = OpenPositions(config.oanda_account_id)
             response: Dict[str, Any] = self._oanda_client.request(r)
             positions = response.get("positions", [])
+            self._open_positions.clear()
             for pos in positions:
                 instrument = pos.get("instrument", "")
                 long_units = float(pos.get("long", {}).get("units", 0))
@@ -381,6 +382,18 @@ class OrderExecutor:
                 return None
 
             order_id = fill_tx.get("id") or f"oanda_{int(time.time())}"
+
+            # Verify stop-loss and take-profit were confirmed by OANDA
+            has_tp = "takeProfitOrderTransaction" in response
+            has_sl = "stopLossOrderTransaction" in response
+            if not has_tp or not has_sl:
+                logger.warning(
+                    f"Stop/TP not confirmed by OANDA — position is unprotected | "
+                    f"id={order_id} has_tp={has_tp} has_sl={has_sl}"
+                )
+                self._last_order_attempt_ts = 0.0
+                return None
+
             position = Position(
                 symbol=instrument,
                 side=side,
@@ -779,6 +792,89 @@ class OrderExecutor:
             self._open_positions.clear()
         except Exception as exc:
             logger.error(f"close_all_positions failed: {exc!r}")
+
+    async def close_position_by_symbol(self, symbol: str, reason: str) -> None:
+        """Close the OANDA position for *symbol* and remove it from the tracker.
+
+        Uses OANDA's PositionClose endpoint for the correct direction.  If the
+        position is already gone (CLOSEOUT_POSITION_DOESNT_EXIST) the tracker
+        entry is removed silently.
+
+        Args:
+            symbol: OANDA instrument string, e.g. ``"EUR_USD"``.
+            reason: Exit reason string for the TradeRecord log.
+        """
+        from oandapyV20.endpoints import positions as oanda_positions
+
+        pos_to_close: Optional[Position] = None
+        pos_id: Optional[str] = None
+        for oid, pos in self._open_positions.items():
+            if pos.symbol == symbol:
+                pos_to_close = pos
+                pos_id = oid
+                break
+
+        if pos_to_close is None:
+            return
+
+        data = {
+            "longUnits": "ALL" if pos_to_close.side == "LONG" else "NONE",
+            "shortUnits": "ALL" if pos_to_close.side == "SHORT" else "NONE",
+        }
+
+        try:
+            r = oanda_positions.PositionClose(
+                config.oanda_account_id,
+                instrument=symbol,
+                data=data,
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: self._oanda_client.request(r))
+
+            price = self._dm.fast_primary.latest_price() or pos_to_close.entry_price
+            now = datetime.now(timezone.utc)
+            gross = (
+                (price - pos_to_close.entry_price) * pos_to_close.quantity
+                if pos_to_close.side == "LONG"
+                else (pos_to_close.entry_price - price) * pos_to_close.quantity
+            )
+            net = self._spread.net_pnl(gross, pos_to_close.quantity)
+            self._logger.log_trade(TradeRecord(
+                symbol=pos_to_close.symbol,
+                side=pos_to_close.side,
+                entry_price=pos_to_close.entry_price,
+                quantity=pos_to_close.quantity,
+                stop_price=pos_to_close.stop_price,
+                take_profit_price=pos_to_close.take_profit_price,
+                entry_time=pos_to_close.entry_time,
+                order_id=pos_to_close.order_id,
+                signal_scores_at_entry=pos_to_close.signal_scores_at_entry,
+                weights_at_entry=pos_to_close.weights_at_entry,
+                regime_at_entry=pos_to_close.regime_at_entry,
+                exit_price=price,
+                exit_time=now,
+                exit_reason=reason,
+                gross_pnl=gross,
+                net_pnl=net,
+                spread_cost=gross - net,
+                duration_seconds=(now - pos_to_close.entry_time).total_seconds(),
+            ))
+            del self._open_positions[pos_id]
+            logger.info(
+                f"Position closed | {symbol} {pos_to_close.side} "
+                f"reason={reason} net={net:+.4f}"
+            )
+
+        except Exception as exc:
+            exc_str = str(exc)
+            if "CLOSEOUT_POSITION_DOESNT_EXIST" in exc_str:
+                logger.warning(
+                    f"Position {pos_id} ({symbol}) not found on OANDA — clearing tracker"
+                )
+            else:
+                logger.error(f"close_position_by_symbol({symbol}): {exc!r}")
+            if pos_id and pos_id in self._open_positions:
+                del self._open_positions[pos_id]
 
     def update_positions(self, positions_list: List[Any]) -> None:
         """Sync internal position state with Alpaca's live position list.
