@@ -206,6 +206,7 @@ class OrderExecutor:
         self._profile = profile
         self._open_positions: Dict[str, Position] = {}  # keyed by order_id
         self._last_order_attempt_ts: float = 0.0        # cooldown after failed orders
+        self._last_order_time: Dict[str, float] = {}    # per-symbol submission timestamp
 
         from phase1.behavior import PacedAPIClient, default_rate_limiter
         self._paced = PacedAPIClient(
@@ -396,6 +397,7 @@ class OrderExecutor:
             self._open_positions[str(order_id)] = position
             logger.info(f"OANDA order submitted: id={order_id} regime={regime_name}")
             self._last_order_attempt_ts = 0.0  # clear cooldown on success
+            self._last_order_time[instrument] = time.time()
 
             # Post-fill verification: compare local count to OANDA without overwriting metadata
             oanda_count = self._count_oanda_positions()

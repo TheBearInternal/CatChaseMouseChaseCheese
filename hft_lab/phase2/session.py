@@ -516,6 +516,26 @@ class SessionManager:
             logger.debug("Position limit reached — skipping signal")
             return
 
+        # Forex FIFO guard: one open position per symbol
+        if config.is_forex():
+            symbol = config.primary_symbol
+            already_open = any(
+                p.symbol == symbol
+                for p in self._executor._open_positions.values()
+            )
+            if already_open:
+                logger.debug(f"FIFO | Position already open for {symbol} — skipping")
+                return
+
+            # Per-symbol submission cooldown
+            last_ts = self._executor._last_order_time.get(symbol, 0.0)
+            if time.time() - last_ts < 30.0:
+                logger.debug(
+                    f"FIFO | Submission cooldown active for {symbol} "
+                    f"({30.0 - (time.time() - last_ts):.0f}s remaining) — skipping"
+                )
+                return
+
         # Behavioral activity filter
         current_min = self._calendar.current_minute()
         if current_min >= 0 and not self._profile.should_act(current_min):
