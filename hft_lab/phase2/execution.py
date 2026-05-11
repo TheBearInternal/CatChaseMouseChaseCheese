@@ -36,6 +36,7 @@ logger = get_logger(__name__)
 STOP_LIMIT_BUFFER_PCT: float = 0.002   # stop-limit price offset from stop trigger
 ORDER_TIME_IN_FORCE: str = "day"
 POSITION_CHECK_TIMEOUT_S: float = 5.0  # executor timeout for Alpaca REST calls
+ORDER_COOLDOWN_S: float = 30.0         # cooldown after a failed order submission
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,7 @@ class OrderExecutor:
         self._logger = trade_logger
         self._profile = profile
         self._open_positions: Dict[str, Position] = {}  # keyed by order_id
+        self._last_order_attempt_ts: float = 0.0        # cooldown after failed orders
 
         from phase1.behavior import PacedAPIClient, default_rate_limiter
         self._paced = PacedAPIClient(
@@ -211,6 +213,14 @@ class OrderExecutor:
             rate_limiter=default_rate_limiter,
             profile=profile,
         )
+
+        self._oanda_client: Optional[Any] = None
+        if config.is_forex():
+            from oandapyV20 import API as OandaAPI
+            self._oanda_client = OandaAPI(
+                access_token=config.oanda_api_key,
+                environment=config.oanda_environment,
+            )
 
     @staticmethod
     async def _noop_async() -> None:
@@ -225,6 +235,96 @@ class OrderExecutor:
     # Order submission
     # ------------------------------------------------------------------
 
+    async def _submit_forex_bracket(
+        self,
+        side: str,
+        qty: int,
+        entry_price: float,
+        stop_price: float,
+        tp_price: float,
+        atr_value: float,
+        signal_scores: Dict[str, float],
+        weights: Dict[str, float],
+        regime_name: str,
+    ) -> Optional[Position]:
+        """Submit a market bracket order to OANDA and return a tracked Position.
+
+        OANDA handles stop-loss and take-profit server-side.  Positive units
+        indicate a long (buy); negative units indicate a short (sell).
+
+        Args:
+            side:          "LONG" or "SHORT".
+            qty:           OANDA units (base currency, e.g. 1000 = 1 micro-lot).
+            entry_price:   Mid price at submission time (for tracking only).
+            stop_price:    Stop-loss price in instrument quote currency.
+            tp_price:      Take-profit price in instrument quote currency.
+            atr_value:     Raw ATR used for stop/tp calculation (logged).
+            signal_scores: Signal scores at decision time.
+            weights:       Ensemble weights at decision time.
+            regime_name:   RegimeState name string.
+
+        Returns:
+            ``Position`` on success, ``None`` on any error.
+        """
+        from oandapyV20.endpoints import orders as oanda_orders
+
+        instrument = config.primary_symbol
+        units = str(qty) if side == "LONG" else str(-qty)
+        order_data = {
+            "order": {
+                "type": "MARKET",
+                "instrument": instrument,
+                "units": units,
+                "takeProfitOnFill": {
+                    "price": f"{tp_price:.5f}",
+                },
+                "stopLossOnFill": {
+                    "price": f"{stop_price:.5f}",
+                    "timeInForce": "GTC",
+                },
+            }
+        }
+
+        logger.info(
+            f"Order | {side} {qty} {instrument} @ {entry_price:.5f} | "
+            f"stop={stop_price:.5f} tp={tp_price:.5f} | ATR={atr_value:.5f}"
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+            r = oanda_orders.OrderCreate(config.oanda_account_id, data=order_data)
+            response: Dict[str, Any] = await loop.run_in_executor(
+                None, lambda: self._oanda_client.request(r)
+            )
+            # Extract the transaction ID from OANDA's response envelope
+            order_id = (
+                response.get("orderFillTransaction", {}).get("id")
+                or response.get("orderCreateTransaction", {}).get("id")
+                or f"oanda_{int(time.time())}"
+            )
+            position = Position(
+                symbol=instrument,
+                side=side,
+                entry_price=entry_price,
+                quantity=qty,
+                stop_price=stop_price,
+                take_profit_price=tp_price,
+                entry_time=datetime.now(timezone.utc),
+                order_id=str(order_id),
+                signal_scores_at_entry=dict(signal_scores),
+                weights_at_entry=dict(weights),
+                regime_at_entry=regime_name,
+            )
+            self._open_positions[str(order_id)] = position
+            logger.info(f"OANDA order submitted: id={order_id} regime={regime_name}")
+            self._last_order_attempt_ts = 0.0  # clear cooldown on success
+            return position
+
+        except Exception as exc:
+            logger.error(f"OANDA order submission failed: {exc!r}")
+            self._last_order_attempt_ts = time.time()
+            return None
+
     async def submit_bracket_order(
         self,
         side: str,
@@ -234,82 +334,129 @@ class OrderExecutor:
         signal_scores: Dict[str, float],
         weights: Dict[str, float],
         regime_name: str,
+        atr_value: float = 0.0,
     ) -> Optional[Position]:
-        """Submit a bracket order to Alpaca and return an open Position on success.
+        """Submit a bracket order and return an open Position on success.
 
-        Applies ``gaussian_jitter`` from the behavior profile before submission.
-        Runs additional validation when ``Config.is_live()`` is True.
+        Routes to OANDA when ``config.is_forex()``, otherwise submits a
+        Alpaca bracket order.  Enforces a 30-second retry cooldown after
+        any failed submission.
 
         Args:
             side:                  "LONG" or "SHORT".
-            quantity:              Number of shares.
-            stop_distance:         Stop-loss distance in dollars.
-            take_profit_distance:  Take-profit distance in dollars.
+            quantity:              Shares (equity/crypto) or units (forex).
+            stop_distance:         Stop-loss distance in price units.
+            take_profit_distance:  Take-profit distance in price units.
             signal_scores:         Signal scores at decision time.
             weights:               Ensemble weights at decision time.
             regime_name:           RegimeState name string.
+            atr_value:             Raw ATR used for stop/tp (logged only).
 
         Returns:
             ``Position`` on successful submission, ``None`` on any error.
         """
-        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-        from alpaca.trading.requests import (
-            LimitOrderRequest,
-            TakeProfitRequest,
-            StopLossRequest,
-        )
         from phase1.behavior import gaussian_jitter
 
+        # --- Cooldown gate ------------------------------------------------
+        elapsed = time.time() - self._last_order_attempt_ts
+        if self._last_order_attempt_ts > 0 and elapsed < ORDER_COOLDOWN_S:
+            remaining = int(ORDER_COOLDOWN_S - elapsed)
+            logger.warning(
+                f"Order cooldown active | {remaining}s remaining — skipping signal"
+            )
+            return None
+
+        # --- Position limit -----------------------------------------------
         if len(self._open_positions) >= config.max_open_positions:
             logger.debug(
                 f"MAX_OPEN_POSITIONS ({config.max_open_positions}) reached — skipping"
             )
             return None
 
+        # --- Entry price (mid) and bracket levels -------------------------
+        bid = self._dm.fast_primary.latest_bid()
+        ask = self._dm.fast_primary.latest_ask()
+        if bid is not None and ask is not None:
+            entry_price = (bid + ask) / 2.0
+        else:
+            entry_price = self._dm.fast_primary.latest_price()
+        if entry_price is None:
+            logger.warning("Cannot submit order: price unavailable")
+            return None
+
+        if side == "LONG":
+            stop_price = entry_price - stop_distance
+            tp_price = entry_price + take_profit_distance
+        else:
+            stop_price = entry_price + stop_distance
+            tp_price = entry_price - take_profit_distance
+
+        # --- Pre-submission jitter ----------------------------------------
+        jitter_ms = gaussian_jitter(0.0, self._profile.polling_jitter_sigma)
+        await asyncio.sleep(jitter_ms / 1000.0)
+
+        # --- Forex path (OANDA) -------------------------------------------
+        if config.is_forex():
+            return await self._submit_forex_bracket(
+                side=side,
+                qty=quantity,
+                entry_price=entry_price,
+                stop_price=round(stop_price, 5),
+                tp_price=round(tp_price, 5),
+                atr_value=atr_value,
+                signal_scores=signal_scores,
+                weights=weights,
+                regime_name=regime_name,
+            )
+
+        # --- Equity / Crypto path (Alpaca) --------------------------------
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+        from alpaca.trading.requests import (
+            LimitOrderRequest,
+            TakeProfitRequest,
+            StopLossRequest,
+        )
+
         fill_price = self._spread.adjust_fill_price(side)
         if fill_price is None:
             logger.warning("Cannot submit order: fill price unavailable")
             return None
 
-        if side == "LONG":
-            alpaca_side = OrderSide.BUY
-            stop_price = round(fill_price - stop_distance, 2)
-            tp_price = round(fill_price + take_profit_distance, 2)
-        else:
-            alpaca_side = OrderSide.SELL
-            stop_price = round(fill_price + stop_distance, 2)
-            tp_price = round(fill_price - take_profit_distance, 2)
+        alpaca_side = OrderSide.BUY if side == "LONG" else OrderSide.SELL
+        stop_price_r = round(stop_price, 2)
+        tp_price_r = round(tp_price, 2)
+        fill_price_r = round(fill_price, 2)
 
         # Live account extra validation
         if config.is_live():
-            if quantity * fill_price > config.account_limit * 0.5:
+            if quantity * fill_price_r > config.account_limit * 0.5:
                 logger.warning(
-                    f"Live account: order value ${quantity * fill_price:.0f} exceeds "
+                    f"Live account: order value ${quantity * fill_price_r:.0f} exceeds "
                     "50% of ACCOUNT_LIMIT — rejected"
                 )
                 return None
-
-        # Pre-submission jitter (behavioral randomization)
-        jitter_ms = gaussian_jitter(0.0, self._profile.polling_jitter_sigma)
-        await asyncio.sleep(jitter_ms / 1000.0)
 
         order_data = LimitOrderRequest(
             symbol=config.primary_symbol,
             qty=quantity,
             side=alpaca_side,
             time_in_force=TimeInForce.DAY,
-            limit_price=fill_price,
+            limit_price=fill_price_r,
             order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
+            take_profit=TakeProfitRequest(limit_price=tp_price_r),
             stop_loss=StopLossRequest(
-                stop_price=stop_price,
-                limit_price=round(stop_price * (0.998 if side == "LONG" else 1.002), 2),
+                stop_price=stop_price_r,
+                limit_price=round(
+                    stop_price_r * (0.998 if side == "LONG" else 1.002), 2
+                ),
             ),
         )
 
         logger.info(
-            f"Submitting {side} bracket | qty={quantity} entry={fill_price:.2f} "
-            f"stop={stop_price:.2f} tp={tp_price:.2f} regime={regime_name}"
+            f"Order | {side} {quantity} {config.primary_symbol} "
+            f"@ {entry_price:.2f} | "
+            f"stop={stop_price_r:.2f} tp={tp_price_r:.2f} | "
+            f"ATR={atr_value:.4f} regime={regime_name}"
         )
 
         try:
@@ -319,10 +466,10 @@ class OrderExecutor:
             position = Position(
                 symbol=config.primary_symbol,
                 side=side,
-                entry_price=fill_price,
+                entry_price=entry_price,
                 quantity=quantity,
-                stop_price=stop_price,
-                take_profit_price=tp_price,
+                stop_price=stop_price_r,
+                take_profit_price=tp_price_r,
                 entry_time=datetime.now(timezone.utc),
                 order_id=str(order.id),
                 signal_scores_at_entry=dict(signal_scores),
@@ -330,11 +477,13 @@ class OrderExecutor:
                 regime_at_entry=regime_name,
             )
             self._open_positions[str(order.id)] = position
-            logger.info(f"Order submitted: id={order.id} status={order.status}")
+            logger.info(f"Alpaca order submitted: id={order.id} status={order.status}")
+            self._last_order_attempt_ts = 0.0  # clear cooldown on success
             return position
 
         except Exception as exc:
             logger.error(f"Order submission failed: {exc!r}")
+            self._last_order_attempt_ts = time.time()
             return None
 
     # ------------------------------------------------------------------
@@ -342,13 +491,20 @@ class OrderExecutor:
     # ------------------------------------------------------------------
 
     async def check_positions(self) -> List[TradeRecord]:
-        """Poll Alpaca for position updates and detect newly closed positions.
+        """Poll for position updates and detect newly closed positions.
+
+        For equity/crypto, queries Alpaca.  For forex, OANDA manages stop-loss
+        and take-profit server-side, so this method returns an empty list
+        (closures are reported via OANDA's streaming transaction feed, not polled).
 
         Returns:
             List of ``TradeRecord`` instances for every position that closed
             since the last call (stop hit, take-profit hit, or manually closed).
         """
         if not self._open_positions:
+            return []
+
+        if config.is_forex():
             return []
 
         try:
@@ -435,12 +591,62 @@ class OrderExecutor:
     async def close_all_positions(self, reason: str) -> None:
         """Emergency flatten: submit market orders to close every open position.
 
+        For forex, issues OANDA position-close requests for each tracked
+        position.  For equity/crypto, calls Alpaca's bulk close endpoint.
+
         Args:
             reason: Exit reason string recorded in TradeRecord.
         """
         if not self._open_positions:
             return
         logger.info(f"Closing all positions — reason: {reason}")
+
+        if config.is_forex():
+            from oandapyV20.endpoints import positions as oanda_positions
+            now = datetime.now(timezone.utc)
+            closed: List[str] = []
+            for oid, pos in self._open_positions.items():
+                try:
+                    data = {
+                        "longUnits": "ALL" if pos.side == "LONG" else "NONE",
+                        "shortUnits": "ALL" if pos.side == "SHORT" else "NONE",
+                    }
+                    r = oanda_positions.PositionClose(
+                        config.oanda_account_id,
+                        instrument=pos.symbol,
+                        data=data,
+                    )
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None, lambda: self._oanda_client.request(r)
+                    )
+                    price = self._dm.fast_primary.latest_price() or pos.entry_price
+                    gross = (
+                        (price - pos.entry_price) * pos.quantity
+                        if pos.side == "LONG"
+                        else (pos.entry_price - price) * pos.quantity
+                    )
+                    net = self._spread.net_pnl(gross, pos.quantity)
+                    self._logger.log_trade(TradeRecord(
+                        symbol=pos.symbol, side=pos.side,
+                        entry_price=pos.entry_price, quantity=pos.quantity,
+                        stop_price=pos.stop_price,
+                        take_profit_price=pos.take_profit_price,
+                        entry_time=pos.entry_time, order_id=pos.order_id,
+                        signal_scores_at_entry=pos.signal_scores_at_entry,
+                        weights_at_entry=pos.weights_at_entry,
+                        regime_at_entry=pos.regime_at_entry,
+                        exit_price=price, exit_time=now, exit_reason=reason,
+                        gross_pnl=gross, net_pnl=net, spread_cost=gross - net,
+                        duration_seconds=(now - pos.entry_time).total_seconds(),
+                    ))
+                    closed.append(oid)
+                except Exception as exc:
+                    logger.error(f"OANDA close position {oid} failed: {exc!r}")
+            for oid in closed:
+                del self._open_positions[oid]
+            return
+
         try:
             await self._run_sync(self._client.close_all_positions, cancel_orders=True)
             now = datetime.now(timezone.utc)

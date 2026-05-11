@@ -515,17 +515,22 @@ class SessionManager:
             logger.debug(f"BehaviorProfile suppressed action at minute {current_min}")
             return
 
-        # Fetch account equity for sizing
+        # Fetch account equity for sizing — skip Alpaca for forex
         price = self._dm.fast_primary.latest_price()
         if price is None:
             return
 
-        try:
-            loop = asyncio.get_running_loop()
-            account = await loop.run_in_executor(None, self._executor._client.get_account)
-            equity = float(getattr(account, "equity", config.account_limit))
-        except Exception:
+        if config.is_forex():
             equity = config.account_limit
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+                account = await loop.run_in_executor(
+                    None, self._executor._client.get_account
+                )
+                equity = float(getattr(account, "equity", config.account_limit))
+            except Exception:
+                equity = config.account_limit
 
         # Compute base position size then apply event risk multiplier
         quantity = self._garch.compute_position_size(
@@ -537,9 +542,10 @@ class SessionManager:
         )
         quantity = max(config.min_position_size, int(quantity * risk_mult))
 
-        # Compute stop and take-profit distances
+        # Compute stop and take-profit distances; derive raw ATR for order log
         stop_dist = self._atr.compute_stop_distance()
         tp_dist = self._atr.compute_take_profit_distance(stop_dist)
+        atr_value = stop_dist / config.atr_stop_multiplier if config.atr_stop_multiplier > 0 else stop_dist
 
         # Spread viability check
         expected_profit = tp_dist * quantity
@@ -562,6 +568,7 @@ class SessionManager:
             signal_scores=signal_scores,
             weights=weights,
             regime_name=regime.value,
+            atr_value=atr_value,
         )
 
     async def _on_trade_closed(
