@@ -666,9 +666,10 @@ class SessionManager:
     async def _monitor_positions(self) -> None:
         """Every 30 seconds, reconcile the local tracker against OANDA's live state.
 
-        If OANDA reports 0 open positions while the tracker holds 1 or more
-        (i.e. SL/TP hit or position closed externally), the tracker is cleared
-        and the event is logged so the next tick can enter fresh.
+        Runs unconditionally — even with an empty tracker — so positions that
+        exist on OANDA but are missing locally are rediscovered.  The executor
+        applies the sync on the event loop and defers it while an order
+        submission is in flight.
         """
         while not self._stop_event.is_set():
             try:
@@ -677,21 +678,23 @@ class SessionManager:
             except asyncio.TimeoutError:
                 pass
 
-            if not self._executor._open_positions:
-                continue
-
             before_count = len(self._executor._open_positions)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, self._executor._sync_positions_from_oanda
-            )
+            synced = await self._executor.sync_positions_from_oanda()
+            if not synced:
+                continue
             after_count = len(self._executor._open_positions)
 
-            if before_count > 0 and after_count == 0:
-                logger.info(
-                    "Position monitor | OANDA reports 0 open — clearing tracker "
-                    "(TP/SL hit or externally closed)"
-                )
+            if after_count != before_count:
+                if after_count == 0:
+                    logger.info(
+                        "Position monitor | OANDA reports 0 open — clearing tracker "
+                        "(TP/SL hit or externally closed)"
+                    )
+                else:
+                    logger.info(
+                        f"Position monitor | reconciled {before_count} → "
+                        f"{after_count} tracked position(s)"
+                    )
 
     # ------------------------------------------------------------------
     # Helpers

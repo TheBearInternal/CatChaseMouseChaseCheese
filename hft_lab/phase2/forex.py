@@ -346,9 +346,7 @@ class OANDAStreamingConnection:
                     # On reconnect, sync positions before resuming the stream
                     if attempt > 0 and self._order_executor is not None:
                         logger.info("Stream reconnect — syncing positions from OANDA")
-                        await loop.run_in_executor(
-                            None, self._order_executor._sync_positions_from_oanda
-                        )
+                        await self._order_executor.sync_positions_from_oanda()
 
                     await loop.run_in_executor(
                         self._thread_executor,

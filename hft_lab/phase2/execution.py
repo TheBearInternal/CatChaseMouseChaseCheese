@@ -207,6 +207,9 @@ class OrderExecutor:
         self._open_positions: Dict[str, Position] = {}  # keyed by order_id
         self._last_order_attempt_ts: float = 0.0        # cooldown after failed orders
         self._last_order_time: Dict[str, float] = {}    # per-symbol submission timestamp
+        self._order_in_flight: bool = False             # defers tracker syncs mid-submission
+        self._positions_lock: asyncio.Lock = asyncio.Lock()
+        self._tracker_version: int = 0                  # bumped on every tracker mutation
 
         from phase1.behavior import PacedAPIClient, default_rate_limiter
         self._paced = PacedAPIClient(
@@ -221,55 +224,100 @@ class OrderExecutor:
             self._oanda_client = OandaAPI(
                 access_token=config.oanda_api_key,
                 environment=config.oanda_environment,
+                request_params={"timeout": 10},
             )
-            self._sync_positions_from_oanda()
+            self._initial_position_sync()
 
-    def _sync_positions_from_oanda(self) -> None:
-        """Populate _open_positions from OANDA open positions on startup.
+    def _fetch_oanda_open_positions(self) -> Optional[List[Dict[str, Any]]]:
+        """Blocking OANDA OpenPositions request.
 
-        Restores position state so the session can correctly detect exits after
-        a restart without creating ghost positions or missing close events.
+        Returns the raw positions list, or ``None`` on any error so callers
+        can distinguish "no positions" from "fetch failed".
         """
         try:
             from oandapyV20.endpoints.positions import OpenPositions
 
             r = OpenPositions(config.oanda_account_id)
             response: Dict[str, Any] = self._oanda_client.request(r)
-            positions = response.get("positions", [])
-            self._open_positions.clear()
-            for pos in positions:
-                instrument = pos.get("instrument", "")
-                long_units = float(pos.get("long", {}).get("units", 0))
-                short_units = float(pos.get("short", {}).get("units", 0))
-                if abs(long_units) < 1 and abs(short_units) < 1:
-                    continue
-                side = "LONG" if long_units > 0 else "SHORT"
-                qty = int(abs(long_units if long_units != 0 else short_units))
-                avg_price = float(
-                    pos.get("long" if side == "LONG" else "short", {}).get(
-                        "averagePrice", 0.0
-                    )
-                )
-                synthetic_id = f"oanda_sync_{instrument}_{int(time.time())}"
-                self._open_positions[synthetic_id] = Position(
-                    symbol=instrument,
-                    side=side,
-                    entry_price=avg_price,
-                    quantity=qty,
-                    stop_price=0.0,
-                    take_profit_price=0.0,
-                    entry_time=datetime.now(timezone.utc),
-                    order_id=synthetic_id,
-                    signal_scores_at_entry={},
-                    weights_at_entry={},
-                    regime_at_entry="unknown",
-                )
-            logger.info(
-                f"Position sync | found {len(self._open_positions)} open "
-                f"position(s) from OANDA"
-            )
+            if not isinstance(response, dict):
+                return None
+            return response.get("positions", [])
         except Exception as exc:
-            logger.warning(f"OANDA position sync failed: {exc!r} — starting with empty state")
+            logger.warning(f"OANDA position fetch failed: {exc!r}")
+            return None
+
+    def _build_tracker_from_snapshot(
+        self, positions: List[Dict[str, Any]]
+    ) -> Dict[str, Position]:
+        """Convert a raw OANDA positions snapshot into tracker entries (no I/O)."""
+        tracker: Dict[str, Position] = {}
+        for pos in positions:
+            instrument = pos.get("instrument", "")
+            long_units = float(pos.get("long", {}).get("units", 0))
+            short_units = float(pos.get("short", {}).get("units", 0))
+            if abs(long_units) < 1 and abs(short_units) < 1:
+                continue
+            side = "LONG" if long_units > 0 else "SHORT"
+            qty = int(abs(long_units if long_units != 0 else short_units))
+            avg_price = float(
+                pos.get("long" if side == "LONG" else "short", {}).get(
+                    "averagePrice", 0.0
+                )
+            )
+            synthetic_id = f"oanda_sync_{instrument}_{int(time.time())}"
+            tracker[synthetic_id] = Position(
+                symbol=instrument,
+                side=side,
+                entry_price=avg_price,
+                quantity=qty,
+                stop_price=0.0,
+                take_profit_price=0.0,
+                entry_time=datetime.now(timezone.utc),
+                order_id=synthetic_id,
+                signal_scores_at_entry={},
+                weights_at_entry={},
+                regime_at_entry="unknown",
+            )
+        return tracker
+
+    def _initial_position_sync(self) -> None:
+        """Populate the tracker from OANDA at startup (runs before the event loop)."""
+        snapshot = self._fetch_oanda_open_positions()
+        if snapshot is None:
+            logger.warning("OANDA startup position sync failed — tracker starts empty")
+            return
+        self._open_positions = self._build_tracker_from_snapshot(snapshot)
+        logger.info(
+            f"Position sync | found {len(self._open_positions)} open "
+            f"position(s) from OANDA"
+        )
+
+    async def sync_positions_from_oanda(self) -> bool:
+        """Reconcile the tracker with OANDA's live positions, event-loop safe.
+
+        The blocking HTTP fetch runs in a worker thread; the tracker swap is
+        applied on the event loop under ``_positions_lock``.  The sync is
+        deferred while an order submission is in flight and discarded if the
+        tracker was mutated after the snapshot was taken, so a stale snapshot
+        can never wipe a just-filled position.
+
+        Returns:
+            ``True`` when the sync was applied, ``False`` when skipped or failed.
+        """
+        if self._order_in_flight:
+            logger.debug("Position sync deferred — order submission in flight")
+            return False
+        version_before = self._tracker_version
+        loop = asyncio.get_running_loop()
+        snapshot = await loop.run_in_executor(None, self._fetch_oanda_open_positions)
+        if snapshot is None:
+            return False
+        if self._order_in_flight or self._tracker_version != version_before:
+            logger.debug("Position sync discarded — tracker changed during fetch")
+            return False
+        async with self._positions_lock:
+            self._open_positions = self._build_tracker_from_snapshot(snapshot)
+        return True
 
     def _count_oanda_positions(self) -> Optional[int]:
         """Return the number of non-zero positions OANDA currently holds, or None on error.
@@ -360,6 +408,9 @@ class OrderExecutor:
             f"stop={stop_price:.5f} tp={tp_price:.5f} | ATR={atr_value:.5f}"
         )
 
+        reconcile_needed = False
+        result: Optional[Position] = None
+        self._order_in_flight = True
         try:
             loop = asyncio.get_running_loop()
             r = oanda_orders.OrderCreate(config.oanda_account_id, data=order_data)
@@ -367,18 +418,17 @@ class OrderExecutor:
                 None, lambda: self._oanda_client.request(r)
             )
 
-            # Bug 2: set cooldown immediately after every submission attempt;
-            # cleared to 0.0 only on genuine fill + stop/TP confirmed success
+            # Cooldown starts on every submission attempt; cleared only after
+            # a confirmed fill is tracked
             self._last_order_attempt_ts = time.time()
 
-            # Bug 4: guard against None or non-dict response
             if not response or not isinstance(response, dict):
+                # The request may or may not have reached OANDA — reconcile
                 logger.error(f"OANDA returned invalid response: {response!r}")
-                return None
+                reconcile_needed = True
 
-            fill_tx = response.get("orderFillTransaction")
-            if fill_tx is None:
-                # Order was queued or rejected — no position opened
+            elif response.get("orderFillTransaction") is None:
+                # Order was rejected or cancelled (FOK) — no position opened
                 order_id = (
                     response.get("orderCreateTransaction", {}).get("id")
                     or f"oanda_{int(time.time())}"
@@ -387,53 +437,114 @@ class OrderExecutor:
                     f"Order id={order_id} did not result in immediate fill "
                     "— not counting as open position"
                 )
-                return None
 
-            order_id = fill_tx.get("id") or f"oanda_{int(time.time())}"
+            else:
+                fill_tx = response["orderFillTransaction"]
+                order_id = fill_tx.get("id") or f"oanda_{int(time.time())}"
+                trade_id = (fill_tx.get("tradeOpened") or {}).get("tradeID")
 
-            # Bug 1: check at top level of response (not inside fill_tx)
-            has_tp = "takeProfitOrderTransaction" in response
-            has_sl = "stopLossOrderTransaction" in response
-            if not has_tp or not has_sl:
-                logger.warning(
-                    f"Stop/TP not confirmed by OANDA — position is unprotected | "
-                    f"id={order_id} has_tp={has_tp} has_sl={has_sl}"
-                )
-                return None
+                if trade_id is None:
+                    # Fill netted against existing exposure instead of opening
+                    # a trade — the tracker no longer matches reality
+                    logger.warning(
+                        f"Order {order_id} filled but opened no new trade "
+                        "(netted against existing exposure) — reconciling"
+                    )
+                    reconcile_needed = True
+                else:
+                    # A fill is live money: track it unconditionally
+                    position = Position(
+                        symbol=instrument,
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=qty,
+                        stop_price=stop_price,
+                        take_profit_price=tp_price,
+                        entry_time=datetime.now(timezone.utc),
+                        order_id=str(order_id),
+                        signal_scores_at_entry=dict(signal_scores),
+                        weights_at_entry=dict(weights),
+                        regime_at_entry=regime_name,
+                    )
+                    self._open_positions[str(order_id)] = position
+                    self._tracker_version += 1
+                    logger.info(
+                        f"OANDA order filled: id={order_id} trade={trade_id} "
+                        f"regime={regime_name}"
+                    )
+                    self._last_order_attempt_ts = 0.0
+                    self._last_order_time[instrument] = time.time()
 
-            position = Position(
-                symbol=instrument,
-                side=side,
-                entry_price=entry_price,
-                quantity=qty,
-                stop_price=stop_price,
-                take_profit_price=tp_price,
-                entry_time=datetime.now(timezone.utc),
-                order_id=str(order_id),
-                signal_scores_at_entry=dict(signal_scores),
-                weights_at_entry=dict(weights),
-                regime_at_entry=regime_name,
-            )
-            self._open_positions[str(order_id)] = position
-            logger.info(f"OANDA order submitted: id={order_id} regime={regime_name}")
-            self._last_order_attempt_ts = 0.0  # clear cooldown — genuine fill confirmed
-            self._last_order_time[instrument] = time.time()
-
-            # Post-fill verification: compare local count to OANDA without overwriting metadata
-            oanda_count = self._count_oanda_positions()
-            local_count = len(self._open_positions)
-            if oanda_count is not None and oanda_count != local_count:
-                logger.warning(
-                    f"Position count mismatch after fill: local={local_count}, "
-                    f"OANDA reports {oanda_count} — trusting OANDA"
-                )
-
-            return position
+                    # Confirm OANDA attached the on-fill stop/TP to the trade;
+                    # close immediately rather than leave a naked position live
+                    if await self._verify_trade_protection(trade_id):
+                        result = position
+                    else:
+                        logger.warning(
+                            f"Trade {trade_id} has no stop/TP attached — "
+                            "closing immediately for safety"
+                        )
+                        await self.close_position_by_symbol(
+                            instrument, reason="unprotected"
+                        )
+                        self._last_order_attempt_ts = time.time()
 
         except Exception as exc:
+            # The order may have reached OANDA before the failure — never
+            # assume no fill happened; reconcile with OANDA instead
             logger.error(f"OANDA order submission failed: {exc!r}")
             self._last_order_attempt_ts = time.time()
-            return None
+            reconcile_needed = True
+        finally:
+            self._order_in_flight = False
+
+        if reconcile_needed:
+            await self.sync_positions_from_oanda()
+        return result
+
+    async def _verify_trade_protection(self, trade_id: str) -> bool:
+        """Confirm OANDA attached stop-loss and take-profit orders to a trade.
+
+        Queries GET /trades/{id} in a worker thread and checks the
+        ``takeProfitOrder`` and ``stopLossOrder`` fields of the trade.  Fails
+        OPEN on API errors: on-fill dependents are validated atomically by
+        OANDA at order acceptance, so a failed *check* is not evidence of a
+        naked trade and must not trigger closing a protected position.
+
+        Args:
+            trade_id: OANDA trade ID from orderFillTransaction.tradeOpened.
+
+        Returns:
+            ``False`` only on positive evidence that protection is missing.
+        """
+        from oandapyV20.endpoints import trades as oanda_trades
+
+        try:
+            loop = asyncio.get_running_loop()
+            r = oanda_trades.TradeDetails(
+                config.oanda_account_id, tradeID=str(trade_id)
+            )
+            response: Dict[str, Any] = await loop.run_in_executor(
+                None, lambda: self._oanda_client.request(r)
+            )
+            trade = (response or {}).get("trade", {})
+            if trade.get("state") == "CLOSED":
+                # Trade already closed (e.g. stop/TP triggered instantly)
+                return True
+            has_tp = bool(trade.get("takeProfitOrder"))
+            has_sl = bool(trade.get("stopLossOrder"))
+            if has_tp and has_sl:
+                return True
+            logger.warning(
+                f"Trade {trade_id} protection check: has_tp={has_tp} has_sl={has_sl}"
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                f"Trade protection check failed for {trade_id}: {exc!r} "
+                "— assuming protected (on-fill dependents are atomic)"
+            )
+            return True
 
     async def submit_bracket_order(
         self,
@@ -715,7 +826,7 @@ class OrderExecutor:
             from oandapyV20.endpoints import positions as oanda_positions
             now = datetime.now(timezone.utc)
             closed: List[str] = []
-            for oid, pos in self._open_positions.items():
+            for oid, pos in list(self._open_positions.items()):
                 try:
                     data = {
                         "longUnits": "ALL" if pos.side == "LONG" else "NONE",
@@ -760,8 +871,11 @@ class OrderExecutor:
                         closed.append(oid)
                     else:
                         logger.error(f"OANDA close position {oid} failed: {exc!r}")
-            for oid in closed:
-                del self._open_positions[oid]
+            async with self._positions_lock:
+                for oid in closed:
+                    self._open_positions.pop(oid, None)
+                if closed:
+                    self._tracker_version += 1
             return
 
         try:
@@ -866,22 +980,31 @@ class OrderExecutor:
                 spread_cost=gross - net,
                 duration_seconds=(now - pos_to_close.entry_time).total_seconds(),
             ))
-            del self._open_positions[pos_id]
+            async with self._positions_lock:
+                self._open_positions.pop(pos_id, None)
+                self._tracker_version += 1
             logger.info(
                 f"Position closed | {symbol} {pos_to_close.side} "
                 f"reason={reason} net={net:+.4f}"
             )
 
         except Exception as exc:
-            exc_str = str(exc)
-            if "CLOSEOUT_POSITION_DOESNT_EXIST" in exc_str:
+            if "CLOSEOUT_POSITION_DOESNT_EXIST" in str(exc):
                 logger.warning(
                     f"Position {pos_id} ({symbol}) not found on OANDA — clearing tracker"
                 )
+                async with self._positions_lock:
+                    self._open_positions.pop(pos_id, None)
+                    self._tracker_version += 1
             else:
-                logger.error(f"close_position_by_symbol({symbol}): {exc!r}")
-            if pos_id and pos_id in self._open_positions:
-                del self._open_positions[pos_id]
+                # Close may have failed transiently while the position is still
+                # live on OANDA — keep it tracked so the FIFO guard holds, set
+                # the cooldown, and let the next attempt or monitor retry
+                logger.error(
+                    f"close_position_by_symbol({symbol}): {exc!r} — keeping "
+                    "position tracked for retry; cooldown set"
+                )
+                self._last_order_attempt_ts = time.time()
 
     def update_positions(self, positions_list: List[Any]) -> None:
         """Sync internal position state with Alpaca's live position list.

@@ -222,6 +222,7 @@ async def _main() -> None:
             environment=config.oanda_environment,
             instruments=[config.primary_symbol, _forex_benchmark],
             data_manager=data_manager,
+            order_executor=order_executor,
         )
     else:
         # Equity and crypto both use the Alpaca WebSocket bridge
