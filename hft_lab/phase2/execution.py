@@ -39,6 +39,26 @@ POSITION_CHECK_TIMEOUT_S: float = 5.0  # executor timeout for Alpaca REST calls
 ORDER_COOLDOWN_S: float = 30.0         # cooldown after a failed order submission
 
 
+def _parse_oanda_time(ts: str) -> datetime:
+    """Parse an OANDA RFC3339 timestamp (nanosecond precision) safely.
+
+    OANDA reports times like ``2026-07-28T12:34:56.123456789Z``;
+    ``datetime.fromisoformat`` only accepts up to microseconds, so the
+    fractional part is trimmed to 6 digits.  Falls back to now() on any
+    parse failure.
+    """
+    try:
+        ts = ts.replace("Z", "+00:00")
+        if "." in ts:
+            head, rest = ts.split(".", 1)
+            tz_idx = max(rest.find("+"), rest.find("-"))
+            frac, tz = (rest[:tz_idx], rest[tz_idx:]) if tz_idx >= 0 else (rest, "")
+            ts = f"{head}.{frac[:6]}{tz}"
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Position dataclass
 # ---------------------------------------------------------------------------
@@ -62,6 +82,8 @@ class Position:
     signal_scores_at_entry: Dict[str, float]
     weights_at_entry: Dict[str, float]
     regime_at_entry: str
+    trade_id: str = ""                 # OANDA trade ID (forex fills only)
+    confidence_at_entry: float = 0.0   # ensemble confidence at decision time
 
 
 # ---------------------------------------------------------------------------
@@ -129,17 +151,19 @@ class TradeLogger:
             record: Completed trade to log.
         """
         self._session_pnl += record.net_pnl
+        # Forex prices need 5 decimals; equity/crypto keep the coarser format
+        prec = 5 if config.is_forex() else 4
         row = [
             record.symbol,
             record.side,
-            f"{record.entry_price:.4f}",
+            f"{record.entry_price:.{prec}f}",
             record.quantity,
-            f"{record.stop_price:.4f}",
-            f"{record.take_profit_price:.4f}",
+            f"{record.stop_price:.{prec}f}",
+            f"{record.take_profit_price:.{prec}f}",
             record.entry_time.isoformat(),
             record.order_id,
             record.regime_at_entry,
-            f"{record.exit_price:.4f}",
+            f"{record.exit_price:.{prec}f}",
             record.exit_time.isoformat(),
             record.exit_reason,
             f"{record.gross_pnl:.4f}",
@@ -149,9 +173,11 @@ class TradeLogger:
         ]
         with open(self._path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
+        log_prec = 5 if config.is_forex() else 2
         logger.info(
             f"Trade logged | {record.side} {record.symbol} "
-            f"entry={record.entry_price:.2f} exit={record.exit_price:.2f} "
+            f"entry={record.entry_price:.{log_prec}f} "
+            f"exit={record.exit_price:.{log_prec}f} "
             f"gross={record.gross_pnl:+.2f} net={record.net_pnl:+.2f} "
             f"reason={record.exit_reason}"
         )
@@ -210,6 +236,9 @@ class OrderExecutor:
         self._order_in_flight: bool = False             # defers tracker syncs mid-submission
         self._positions_lock: asyncio.Lock = asyncio.Lock()
         self._tracker_version: int = 0                  # bumped on every tracker mutation
+        # Async callback(TradeRecord) invoked for each broker-side close the
+        # sync discovers — SessionManager wires this to the IC/Kalman update
+        self.trade_close_listener: Optional[Any] = None
 
         from phase1.behavior import PacedAPIClient, default_rate_limiter
         self._paced = PacedAPIClient(
@@ -292,32 +321,194 @@ class OrderExecutor:
             f"position(s) from OANDA"
         )
 
-    async def sync_positions_from_oanda(self) -> bool:
-        """Reconcile the tracker with OANDA's live positions, event-loop safe.
+    _CLOSE_REASON_MAP: Dict[str, str] = {
+        "TAKE_PROFIT_ORDER": "take_profit",
+        "STOP_LOSS_ORDER": "stop_loss",
+        "MARKET_ORDER": "market_close",
+    }
 
-        The blocking HTTP fetch runs in a worker thread; the tracker swap is
-        applied on the event loop under ``_positions_lock``.  The sync is
-        deferred while an order submission is in flight and discarded if the
-        tracker was mutated after the snapshot was taken, so a stale snapshot
-        can never wipe a just-filled position.
+    def _fetch_closing_fill(
+        self, trade_id: str, from_tx_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Blocking lookup of the ORDER_FILL transaction that closed *trade_id*.
+
+        Scans the account transaction stream since the entry fill transaction
+        for a fill whose ``tradesClosed`` references the trade, giving the
+        broker's actual exit price, realized P&L, and close reason.
 
         Returns:
-            ``True`` when the sync was applied, ``False`` when skipped or failed.
+            Dict with ``price``, ``realized_pl``, ``reason``, ``time`` keys,
+            or ``None`` when the closing fill cannot be found.
+        """
+        try:
+            from oandapyV20.endpoints.transactions import TransactionsSinceID
+
+            r = TransactionsSinceID(
+                config.oanda_account_id, params={"id": str(from_tx_id)}
+            )
+            response: Dict[str, Any] = self._oanda_client.request(r)
+            for tx in response.get("transactions", []):
+                if tx.get("type") != "ORDER_FILL":
+                    continue
+                for reduced in (tx.get("tradesClosed") or []):
+                    if str(reduced.get("tradeID")) == str(trade_id):
+                        return {
+                            "price": float(
+                                reduced.get("price") or tx.get("price") or 0.0
+                            ),
+                            "realized_pl": float(reduced.get("realizedPL", 0.0)),
+                            "reason": str(tx.get("reason", "UNKNOWN")),
+                            "time": str(tx.get("time", "")),
+                        }
+            return None
+        except Exception as exc:
+            logger.warning(
+                f"Closing-fill lookup for trade {trade_id} failed: "
+                f"{summarize_broker_error(exc)}"
+            )
+            return None
+
+    def _build_close_record(
+        self, pos: Position, fill: Optional[Dict[str, Any]]
+    ) -> TradeRecord:
+        """Build a TradeRecord for a broker-side close.
+
+        Uses the broker-reported exit price and realized P&L when the closing
+        fill was found; falls back to the last local price otherwise.
+        """
+        if fill is not None:
+            exit_price = fill["price"]
+            exit_time = _parse_oanda_time(fill["time"])
+            reason = self._CLOSE_REASON_MAP.get(
+                fill["reason"], fill["reason"].lower()
+            )
+        else:
+            exit_price = self._dm.fast_primary.latest_price() or pos.entry_price
+            exit_time = datetime.now(timezone.utc)
+            reason = "broker_close"
+
+        if pos.side == "LONG":
+            gross = (exit_price - pos.entry_price) * pos.quantity
+        else:
+            gross = (pos.entry_price - exit_price) * pos.quantity
+        net = (
+            fill["realized_pl"] if fill is not None
+            else self._spread.net_pnl(gross, pos.quantity)
+        )
+
+        return TradeRecord(
+            symbol=pos.symbol,
+            side=pos.side,
+            entry_price=pos.entry_price,
+            quantity=pos.quantity,
+            stop_price=pos.stop_price,
+            take_profit_price=pos.take_profit_price,
+            entry_time=pos.entry_time,
+            order_id=pos.order_id,
+            signal_scores_at_entry=pos.signal_scores_at_entry,
+            weights_at_entry=pos.weights_at_entry,
+            regime_at_entry=pos.regime_at_entry,
+            exit_price=exit_price,
+            exit_time=exit_time,
+            exit_reason=reason,
+            gross_pnl=gross,
+            net_pnl=net,
+            spread_cost=gross - net,
+            duration_seconds=(exit_time - pos.entry_time).total_seconds(),
+        )
+
+    async def sync_positions_from_oanda(self) -> Optional[List[TradeRecord]]:
+        """Reconcile the tracker with OANDA's live positions, event-loop safe.
+
+        The blocking HTTP fetch runs in a worker thread; tracker mutations are
+        applied on the event loop under ``_positions_lock`` and touch only
+        entries identified from the snapshot, so a concurrently tracked fill
+        is never wiped.  Deferred while an order submission is in flight and
+        discarded if the tracker changed during the fetch.
+
+        Tracked positions that OANDA no longer reports open are converted to
+        ``TradeRecord``s using the broker's closing ORDER_FILL transaction
+        (actual exit price, realized P&L, close reason), written to the trade
+        log, and passed to ``trade_close_listener`` so the session can feed
+        the IC / Kalman learning loop.
+
+        Returns:
+            The list of broker-close records when the sync applied (possibly
+            empty), or ``None`` when the sync was skipped or failed.
         """
         if self._order_in_flight:
             logger.debug("Position sync deferred — order submission in flight")
-            return False
+            return None
         version_before = self._tracker_version
         loop = asyncio.get_running_loop()
         snapshot = await loop.run_in_executor(None, self._fetch_oanda_open_positions)
         if snapshot is None:
-            return False
+            return None
         if self._order_in_flight or self._tracker_version != version_before:
             logger.debug("Position sync discarded — tracker changed during fetch")
-            return False
+            return None
+
+        open_instruments = {
+            pos.get("instrument", "")
+            for pos in snapshot
+            if abs(float(pos.get("long", {}).get("units", 0))) >= 1
+            or abs(float(pos.get("short", {}).get("units", 0))) >= 1
+        }
+
+        # Entries OANDA no longer reports open were closed broker-side
+        closed_entries = [
+            (oid, pos) for oid, pos in self._open_positions.items()
+            if pos.symbol not in open_instruments
+        ]
+
+        closed_records: List[TradeRecord] = []
+        for _oid, pos in closed_entries:
+            if not pos.trade_id:
+                # Synthetic stub from a previous sync — no entry metadata to
+                # score against; it is dropped from the tracker below
+                continue
+            fill = await loop.run_in_executor(
+                None, lambda p=pos: self._fetch_closing_fill(p.trade_id, p.order_id)
+            )
+            record = self._build_close_record(pos, fill)
+            self._logger.log_trade(record)
+            logger.info(
+                f"Trade closed | {record.symbol} {record.side} "
+                f"entry={record.entry_price:.5f} exit={record.exit_price:.5f} "
+                f"pnl={record.net_pnl:+.2f} reason={record.exit_reason}"
+            )
+            closed_records.append(record)
+            if self.trade_close_listener is not None:
+                try:
+                    await self.trade_close_listener(record)
+                except Exception as exc:
+                    logger.error(f"trade_close_listener error: {exc!r}")
+
         async with self._positions_lock:
-            self._open_positions = self._build_tracker_from_snapshot(snapshot)
-        return True
+            for oid, _pos in closed_entries:
+                self._open_positions.pop(oid, None)
+            if closed_entries:
+                self._tracker_version += 1
+            # Import positions OANDA holds that we are not tracking — unless
+            # an order is mid-flight, in which case they arrive next cycle
+            if not self._order_in_flight:
+                tracked_instruments = {
+                    p.symbol for p in self._open_positions.values()
+                }
+                missing = [
+                    pos for pos in snapshot
+                    if pos.get("instrument", "")
+                    in (open_instruments - tracked_instruments)
+                ]
+                if missing:
+                    imported = self._build_tracker_from_snapshot(missing)
+                    self._open_positions.update(imported)
+                    self._tracker_version += 1
+                    logger.info(
+                        f"Position sync | imported {len(imported)} untracked "
+                        f"position(s) from OANDA"
+                    )
+        return closed_records
 
     def _count_oanda_positions(self) -> Optional[int]:
         """Return the number of non-zero positions OANDA currently holds, or None on error.
@@ -366,6 +557,7 @@ class OrderExecutor:
         signal_scores: Dict[str, float],
         weights: Dict[str, float],
         regime_name: str,
+        confidence: float = 0.0,
     ) -> Optional[Position]:
         """Submit a market bracket order to OANDA and return a tracked Position.
 
@@ -467,6 +659,8 @@ class OrderExecutor:
                         signal_scores_at_entry=dict(signal_scores),
                         weights_at_entry=dict(weights),
                         regime_at_entry=regime_name,
+                        trade_id=str(trade_id),
+                        confidence_at_entry=confidence,
                     )
                     self._open_positions[str(order_id)] = position
                     self._tracker_version += 1
@@ -561,6 +755,7 @@ class OrderExecutor:
         weights: Dict[str, float],
         regime_name: str,
         atr_value: float = 0.0,
+        confidence: float = 0.0,
     ) -> Optional[Position]:
         """Submit a bracket order and return an open Position on success.
 
@@ -633,6 +828,7 @@ class OrderExecutor:
                 signal_scores=signal_scores,
                 weights=weights,
                 regime_name=regime_name,
+                confidence=confidence,
             )
 
         # --- Equity / Crypto path (Alpaca) --------------------------------
@@ -701,6 +897,7 @@ class OrderExecutor:
                 signal_scores_at_entry=dict(signal_scores),
                 weights_at_entry=dict(weights),
                 regime_at_entry=regime_name,
+                confidence_at_entry=confidence,
             )
             self._open_positions[str(order.id)] = position
             logger.info(f"Alpaca order submitted: id={order.id} status={order.status}")

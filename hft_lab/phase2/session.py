@@ -232,6 +232,10 @@ class SessionManager:
         self._event_calendar: EventCalendar = EventCalendar(silent=False)
         self._last_calendar_log_ts: float = 0.0
         self._last_summary_ts: float = 0.0
+        self._last_suppressed_minute: Optional[int] = None
+        # Broker-side closes discovered by the position sync feed the same
+        # IC/Kalman learning path the equity flow uses
+        self._executor.trade_close_listener = self._handle_broker_close
 
     def stop(self) -> None:
         """Signal the session loop to exit after the current iteration."""
@@ -556,11 +560,16 @@ class SessionManager:
                 )
                 return
 
-        # Behavioral activity filter
+        # Behavioral activity filter — log once per suppressed minute
         current_min = self._calendar.current_minute()
         if current_min >= 0 and not self._profile.should_act(current_min):
-            logger.debug(f"BehaviorProfile suppressed action at minute {current_min}")
+            if current_min != self._last_suppressed_minute:
+                logger.debug(
+                    f"BehaviorProfile suppressed action at minute {current_min}"
+                )
+                self._last_suppressed_minute = current_min
             return
+        self._last_suppressed_minute = None
 
         # Fetch account equity for sizing — skip Alpaca for forex
         price = self._dm.fast_primary.latest_price()
@@ -618,6 +627,7 @@ class SessionManager:
             weights=weights,
             regime_name=regime.value,
             atr_value=atr_value,
+            confidence=decision.confidence,
         )
 
     async def _on_trade_closed(
@@ -679,8 +689,8 @@ class SessionManager:
                 pass
 
             before_count = len(self._executor._open_positions)
-            synced = await self._executor.sync_positions_from_oanda()
-            if not synced:
+            closed_records = await self._executor.sync_positions_from_oanda()
+            if closed_records is None:
                 continue
             after_count = len(self._executor._open_positions)
 
@@ -695,6 +705,24 @@ class SessionManager:
                         f"Position monitor | reconciled {before_count} → "
                         f"{after_count} tracked position(s)"
                     )
+
+    async def _handle_broker_close(self, record: Any) -> None:
+        """Feed a broker-side close (TP/SL hit on OANDA) into the learning loop.
+
+        Called by the executor's position sync for every TradeRecord it builds
+        from OANDA's closing ORDER_FILL transaction.  Uses the regime recorded
+        at entry so the IC observations update the Kalman weight vector that
+        actually produced the trade.
+        """
+        try:
+            entry_regime = RegimeState(record.regime_at_entry)
+        except ValueError:
+            logger.debug(
+                f"Broker close for {record.symbol}: unknown entry regime "
+                f"{record.regime_at_entry!r} — skipping learning update"
+            )
+            return
+        await self._on_trade_closed(record, {}, entry_regime)
 
     # ------------------------------------------------------------------
     # Helpers
