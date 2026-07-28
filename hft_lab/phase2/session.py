@@ -353,6 +353,10 @@ class SessionManager:
         if weights_state:
             self._kalman.load_state(weights_state)
 
+        # Reconcile trades the broker closed while the engine was offline
+        if config.is_forex():
+            await self._executor.reconcile_offline_closes()
+
         # Select the correct benchmark symbol for the active market type
         if config.is_crypto():
             benchmark = config.crypto_benchmark

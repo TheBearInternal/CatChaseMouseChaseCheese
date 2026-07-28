@@ -326,7 +326,232 @@ class OrderExecutor:
         "TAKE_PROFIT_ORDER": "take_profit",
         "STOP_LOSS_ORDER": "stop_loss",
         "MARKET_ORDER": "market_close",
+        "TRAILING_STOP_LOSS_ORDER": "trailing_stop",
+        "MARKET_ORDER_POSITION_CLOSEOUT": "position_closeout",
     }
+
+    # ORDER_FILL reasons that represent a broker-side close of an open trade
+    _OFFLINE_CLOSE_REASONS: frozenset = frozenset({
+        "TAKE_PROFIT_ORDER",
+        "STOP_LOSS_ORDER",
+        "TRAILING_STOP_LOSS_ORDER",
+        "MARKET_ORDER_POSITION_CLOSEOUT",
+    })
+
+    # ------------------------------------------------------------------
+    # Offline-close reconciliation state (persisted via SlowBuffer)
+    # ------------------------------------------------------------------
+
+    def _record_trade_metadata(self, position: Position) -> None:
+        """Persist the entry snapshot for offline-close reconciliation.
+
+        This is a lookup table keyed by OANDA trade ID — never a source of
+        truth about what is open (OANDA remains authoritative).
+        """
+        if not position.trade_id:
+            return
+        try:
+            meta = self._dm.slow_buffer.data.setdefault("open_trade_metadata", {})
+            meta[str(position.trade_id)] = {
+                "symbol": position.symbol,
+                "side": position.side,
+                "units": position.quantity,
+                "entry_price": position.entry_price,
+                "entry_time": position.entry_time.isoformat(),
+                "signal_scores": dict(position.signal_scores_at_entry),
+                "regime": position.regime_at_entry,
+                "confidence": position.confidence_at_entry,
+            }
+            self._dm.slow_buffer.save(config.session_state_path)
+        except Exception as exc:
+            logger.warning(f"Failed to persist trade metadata: {exc!r}")
+
+    def _clear_trade_metadata(self, trade_id: str) -> None:
+        """Drop a reconciled trade's entry snapshot and persist the change."""
+        if not trade_id:
+            return
+        try:
+            meta = self._dm.slow_buffer.data.get("open_trade_metadata") or {}
+            if str(trade_id) in meta:
+                meta.pop(str(trade_id), None)
+                self._dm.slow_buffer.save(config.session_state_path)
+        except Exception as exc:
+            logger.warning(f"Failed to clear trade metadata {trade_id}: {exc!r}")
+
+    def _note_last_transaction_id(self, last_id: Optional[str]) -> None:
+        """Track OANDA's most recently seen transaction ID (monotonic)."""
+        if not last_id:
+            return
+        data = self._dm.slow_buffer.data
+        try:
+            if int(last_id) > int(data.get("last_transaction_id") or 0):
+                data["last_transaction_id"] = str(last_id)
+        except (TypeError, ValueError):
+            data["last_transaction_id"] = str(last_id)
+
+    def _fetch_transactions_since(
+        self, since_id: str
+    ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """Blocking fetch of all account transactions after *since_id*.
+
+        Returns:
+            ``(transactions, lastTransactionID)`` or ``(None, None)`` on error.
+        """
+        try:
+            from oandapyV20.endpoints.transactions import TransactionsSinceID
+
+            r = TransactionsSinceID(
+                config.oanda_account_id, params={"id": str(since_id)}
+            )
+            response: Dict[str, Any] = self._oanda_client.request(r)
+            if not isinstance(response, dict):
+                return None, None
+            return response.get("transactions", []), response.get("lastTransactionID")
+        except Exception as exc:
+            logger.warning(
+                f"Transaction fetch since {since_id} failed: "
+                f"{summarize_broker_error(exc)}"
+            )
+            return None, None
+
+    async def reconcile_offline_closes(self) -> List[TradeRecord]:
+        """Detect and record trades the broker closed while the engine was down.
+
+        Scans the OANDA transaction stream since the persisted
+        ``last_transaction_id`` for ORDER_FILL transactions whose reason is a
+        broker-side close (TP / SL / trailing stop / margin closeout), matches
+        ``tradesClosed[].tradeID`` against the persisted entry snapshots, and
+        emits full ``TradeRecord``s through the same trade-close path used for
+        live closes so IC and Kalman update normally.  Closes with no stored
+        entry snapshot are logged to the trade CSV but not scored.
+
+        Returns:
+            List of reconciled TradeRecords (empty when nothing was missed).
+        """
+        if not config.is_forex() or self._oanda_client is None:
+            return []
+        data = self._dm.slow_buffer.data
+        last_tx = data.get("last_transaction_id")
+        if not last_tx:
+            return []
+        meta_map: Dict[str, Any] = data.get("open_trade_metadata") or {}
+
+        loop = asyncio.get_running_loop()
+        txs, new_last = await loop.run_in_executor(
+            None, lambda: self._fetch_transactions_since(last_tx)
+        )
+        if txs is None:
+            return []
+
+        records: List[TradeRecord] = []
+        summary_lines: List[str] = []
+        for tx in txs:
+            if tx.get("type") != "ORDER_FILL":
+                continue
+            raw_reason = str(tx.get("reason", ""))
+            if raw_reason not in self._OFFLINE_CLOSE_REASONS:
+                continue
+            exit_time = _parse_oanda_time(str(tx.get("time", "")))
+            for reduced in (tx.get("tradesClosed") or []):
+                trade_id = str(reduced.get("tradeID", ""))
+                exit_price = float(reduced.get("price") or tx.get("price") or 0.0)
+                realized = float(reduced.get("realizedPL", 0.0))
+                mapped_reason = self._CLOSE_REASON_MAP.get(
+                    raw_reason, raw_reason.lower()
+                )
+                snap = meta_map.get(trade_id)
+
+                if snap:
+                    try:
+                        entry_time = datetime.fromisoformat(snap["entry_time"])
+                    except Exception:
+                        entry_time = exit_time
+                    side = str(snap.get("side", "LONG"))
+                    qty = int(snap.get("units", 0)) or 1
+                    entry_price = float(snap.get("entry_price", 0.0))
+                    gross = (
+                        (exit_price - entry_price) if side == "LONG"
+                        else (entry_price - exit_price)
+                    ) * qty
+                    record = TradeRecord(
+                        symbol=str(snap.get("symbol") or tx.get("instrument", "UNKNOWN")),
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=qty,
+                        stop_price=0.0,
+                        take_profit_price=0.0,
+                        entry_time=entry_time,
+                        order_id=f"offline_{trade_id}",
+                        signal_scores_at_entry=dict(snap.get("signal_scores") or {}),
+                        weights_at_entry={},
+                        regime_at_entry=str(snap.get("regime", "unknown")),
+                        exit_price=exit_price,
+                        exit_time=exit_time,
+                        exit_reason=mapped_reason,
+                        gross_pnl=gross,
+                        net_pnl=realized,
+                        spread_cost=gross - realized,
+                        duration_seconds=(exit_time - entry_time).total_seconds(),
+                    )
+                    self._logger.log_trade(record)
+                    if self.trade_close_listener is not None:
+                        try:
+                            await self.trade_close_listener(record)
+                        except Exception as exc:
+                            logger.error(f"trade_close_listener error: {exc!r}")
+                    meta_map.pop(trade_id, None)
+                else:
+                    logger.warning(
+                        f"Offline close {trade_id} has no entry snapshot "
+                        "— logged but not scored"
+                    )
+                    closed_units = float(reduced.get("units", 0) or 0)
+                    side = "LONG" if closed_units < 0 else "SHORT"
+                    record = TradeRecord(
+                        symbol=str(tx.get("instrument", "UNKNOWN")),
+                        side=side,
+                        entry_price=0.0,
+                        quantity=int(abs(closed_units)) or 1,
+                        stop_price=0.0,
+                        take_profit_price=0.0,
+                        entry_time=exit_time,
+                        order_id=f"offline_{trade_id}",
+                        signal_scores_at_entry={},
+                        weights_at_entry={},
+                        regime_at_entry="unknown",
+                        exit_price=exit_price,
+                        exit_time=exit_time,
+                        exit_reason=mapped_reason,
+                        gross_pnl=realized,
+                        net_pnl=realized,
+                        spread_cost=0.0,
+                        duration_seconds=0.0,
+                    )
+                    self._logger.log_trade(record)
+
+                records.append(record)
+                summary_lines.append(
+                    f"  {record.symbol} {record.side:<5} {record.quantity}u | "
+                    f"entry={record.entry_price:.5f} exit={record.exit_price:.5f} | "
+                    f"pnl={record.net_pnl:+.2f} | {raw_reason} | "
+                    f"{exit_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+        self._note_last_transaction_id(new_last)
+        try:
+            self._dm.slow_buffer.save(config.session_state_path)
+        except Exception as exc:
+            logger.warning(f"Failed to persist reconciliation state: {exc!r}")
+
+        if records:
+            net = sum(r.net_pnl for r in records)
+            logger.info(
+                f"Offline reconciliation | {len(records)} trade(s) closed while "
+                "engine was down:\n"
+                + "\n".join(summary_lines)
+                + f"\nNet offline P&L: {net:+.2f} over {len(records)} trade(s)"
+            )
+        return records
 
     def _fetch_closing_fill(
         self, trade_id: str, from_tx_id: str
@@ -360,6 +585,7 @@ class OrderExecutor:
                             "realized_pl": float(reduced.get("realizedPL", 0.0)),
                             "reason": str(tx.get("reason", "UNKNOWN")),
                             "time": str(tx.get("time", "")),
+                            "last_tx": response.get("lastTransactionID"),
                         }
             return None
         except Exception as exc:
@@ -484,6 +710,9 @@ class OrderExecutor:
                     await self.trade_close_listener(record)
                 except Exception as exc:
                     logger.error(f"trade_close_listener error: {exc!r}")
+            if fill is not None:
+                self._note_last_transaction_id(fill.get("last_tx"))
+            self._clear_trade_metadata(pos.trade_id)
 
         async with self._positions_lock:
             for oid, _pos in closed_entries:
@@ -694,6 +923,8 @@ class OrderExecutor:
                     )
                     self._last_order_attempt_ts = 0.0
                     self._last_order_time[instrument] = time.time()
+                    self._note_last_transaction_id(response.get("lastTransactionID"))
+                    self._record_trade_metadata(position)
 
                     # Confirm OANDA attached the on-fill stop/TP to the trade;
                     # close immediately rather than leave a naked position live
@@ -1108,6 +1339,7 @@ class OrderExecutor:
                         duration_seconds=(now - pos.entry_time).total_seconds(),
                     ))
                     closed.append(oid)
+                    self._clear_trade_metadata(pos.trade_id)
                 except Exception as exc:
                     exc_str = str(exc)
                     if "CLOSEOUT_POSITION_DOESNT_EXIST" in exc_str:
@@ -1232,6 +1464,7 @@ class OrderExecutor:
             async with self._positions_lock:
                 self._open_positions.pop(pos_id, None)
                 self._tracker_version += 1
+            self._clear_trade_metadata(pos_to_close.trade_id)
             logger.info(
                 f"Position closed | {symbol} {pos_to_close.side} "
                 f"reason={reason} net={net:+.4f}"
