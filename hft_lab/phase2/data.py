@@ -274,6 +274,13 @@ class DataManager:
         self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
         self._tick_history: deque[tuple[float, int]] = deque(maxlen=TICK_HISTORY_MAXLEN)
         self._last_tick_price: Optional[float] = None
+        # Bar-close snapshots awaiting forward-return maturity for IC scoring:
+        # (timestamp, mid_price, signal_scores_at_t, regime_at_t)
+        self.ic_snapshots: deque[tuple] = deque()
+        # Live 1-minute bar aggregation from ticks (fills MediumBuffer after
+        # warm-up bars age out; nothing else feeds live bars)
+        self._current_bar: Optional[Dict[str, Any]] = None
+        self._current_bar_minute: Optional[datetime] = None
         self._is_crypto: bool = config.is_crypto()
         self._is_forex: bool = config.is_forex()
         self._vwap_proxy_logged: bool = False  # log forex tick-volume note once
@@ -316,9 +323,59 @@ class DataManager:
                     direction = 0
                 self._tick_history.append((float(price), direction))
                 self._last_tick_price = float(price)
+                self._aggregate_tick_into_bar(tick_data, float(price))
 
         elif symbol == config.benchmark_symbol:
             self.fast_benchmark.append(tick_data)
+
+    def _aggregate_tick_into_bar(
+        self, tick_data: Dict[str, Any], price: float
+    ) -> None:
+        """Roll primary-symbol ticks into live 1-minute OHLCV bars.
+
+        On each minute rollover the completed bar is appended to
+        ``medium_primary`` and ``_hist_bars`` — the only live source of new
+        bars for the bar-based signals and bar-close IC scoring.
+
+        Args:
+            tick_data: Raw tick dict (timestamp/volume fields used).
+            price:     Tick price, already validated non-None.
+        """
+        ts = tick_data.get("timestamp") or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        minute = ts.replace(second=0, microsecond=0)
+        volume = float(tick_data.get("volume") or 1.0)
+
+        if self._current_bar is None or self._current_bar_minute is None:
+            self._current_bar_minute = minute
+            self._current_bar = {
+                "timestamp": minute,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": volume,
+                "vwap_contribution": price * volume,
+            }
+            return
+
+        if minute > self._current_bar_minute:
+            completed = self._current_bar
+            self.medium_primary.append(completed)
+            self._hist_bars.append(completed)
+            self._current_bar_minute = minute
+            self._current_bar = {
+                "timestamp": minute,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": volume,
+                "vwap_contribution": price * volume,
+            }
+            return
+
+        bar = self._current_bar
+        bar["high"] = max(bar["high"], price)
+        bar["low"] = min(bar["low"], price)
+        bar["close"] = price
+        bar["volume"] += volume
+        bar["vwap_contribution"] += price * volume
 
     async def ingest_bar(self, bar_data: Dict[str, Any]) -> None:
         """Append a completed 1-minute bar to the MediumBuffer and _hist_bars.
@@ -328,6 +385,36 @@ class DataManager:
         """
         self.medium_primary.append(bar_data)
         self._hist_bars.append(bar_data)
+
+    def record_ic_snapshot(
+        self, price: float, signal_scores: Dict[str, float], regime: Any
+    ) -> List[tuple]:
+        """Store a bar-close snapshot and return matured forward-return events.
+
+        Each snapshot holds the signal scores and regime *as computed at that
+        bar* — they are never recomputed later.  Once a snapshot is
+        ``config.ic_forward_bars`` bars old (one snapshot is pushed per bar
+        close), its realized forward return is computed against the current
+        price and the snapshot is emitted for scoring.
+
+        Args:
+            price:         Bar-close mid price at time t.
+            signal_scores: Signal scores computed at time t.
+            regime:        Regime classified at time t (opaque to DataManager).
+
+        Returns:
+            List of ``(signal_scores_at_t, regime_at_t, forward_return)``
+            events that matured with this push (usually 0 or 1).
+        """
+        events: List[tuple] = []
+        self.ic_snapshots.append(
+            (datetime.now(timezone.utc), float(price), dict(signal_scores), regime)
+        )
+        while len(self.ic_snapshots) > config.ic_forward_bars:
+            _ts, p0, s0, r0 = self.ic_snapshots.popleft()
+            if p0 > 1e-9:
+                events.append((s0, r0, (float(price) - p0) / p0))
+        return events
 
     # ------------------------------------------------------------------
     # Historical warm-up

@@ -196,6 +196,9 @@ class Config:
     min_atr_forex: float
     min_stop_spread_multiple: float
     max_entry_spread: float
+    # Continuous bar-level IC scoring
+    ic_forward_bars: int
+    ic_warm_start_enabled: bool
     # News strategy fields
     reddit_sentiment_enabled: bool
     reddit_client_id: str
@@ -319,6 +322,10 @@ def _load_config() -> Config:
         min_atr_forex=float(os.getenv("MIN_ATR_FOREX", "0.0005")),
         min_stop_spread_multiple=float(os.getenv("MIN_STOP_SPREAD_MULTIPLE", "3.0")),
         max_entry_spread=float(os.getenv("MAX_ENTRY_SPREAD", "0.00040")),
+        ic_forward_bars=int(os.getenv("IC_FORWARD_BARS", "5")),
+        ic_warm_start_enabled=_parse_bool(
+            os.getenv("IC_WARM_START_ENABLED", "true"), "IC_WARM_START_ENABLED"
+        ),
         reddit_client_id=os.getenv("REDDIT_CLIENT_ID", ""),
         reddit_client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
     )

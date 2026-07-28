@@ -251,6 +251,7 @@ class SessionManager:
         self._last_summary_ts: float = 0.0
         self._last_suppressed_minute: Optional[int] = None
         self._in_rollover_blackout: bool = False
+        self._last_ic_bar_ts: Optional[Any] = None
         # Broker-side closes discovered by the position sync feed the same
         # IC/Kalman learning path the equity flow uses
         self._executor.trade_close_listener = self._handle_broker_close
@@ -388,6 +389,9 @@ class SessionManager:
         # Fit GARCH on available historical returns
         await self._fit_garch()
 
+        # Warm-start IC/Kalman from history (no-op if weights already trained)
+        await self._warm_start_ic()
+
         # Kalman prediction step at session open
         self._kalman.predict()
 
@@ -478,6 +482,21 @@ class SessionManager:
 
         # 3. Signal scores
         signal_scores = self._signals.compute_all(regime)
+
+        # 3b. Bar-close IC scoring — learning decoupled from trade outcomes.
+        # On each new bar, snapshot the scores/regime computed at this bar;
+        # snapshots ic_forward_bars old are scored on their realized forward
+        # return and update IC + the Kalman vector of the regime at time t.
+        bars_df = self._dm.medium_primary.to_dataframe()
+        if len(bars_df) > 0:
+            last_bar_ts = bars_df["timestamp"].iloc[-1]
+            if last_bar_ts != self._last_ic_bar_ts:
+                self._last_ic_bar_ts = last_bar_ts
+                bar_close = float(bars_df["close"].iloc[-1])
+                for s0, r0, fwd in self._dm.record_ic_snapshot(
+                    bar_close, signal_scores, regime
+                ):
+                    self._score_ic_observation(s0, r0, fwd)
 
         # 4. News sentiment
         sentiment = self._sentiment.current_sentiment
@@ -747,6 +766,146 @@ class SessionManager:
                         f"Position monitor | reconciled {before_count} → "
                         f"{after_count} tracked position(s)"
                     )
+
+    def _score_ic_observation(
+        self,
+        scores: Dict[str, float],
+        regime: RegimeState,
+        forward_return: float,
+    ) -> None:
+        """Update IC and the regime-conditional Kalman filter from one bar event.
+
+        This is the bar-level learning path — distinct from trade-level
+        TradeRecords, which remain the cost-aware ground truth.
+
+        Args:
+            scores:         Signal scores as computed at time t (never recomputed).
+            regime:         Regime classified at time t (not the current regime).
+            forward_return: Realized return over the following ic_forward_bars bars.
+        """
+        from phase2.signals import SIGNAL_NAMES
+
+        for name in SIGNAL_NAMES:
+            self._ic.update(name, scores.get(name, 0.0), forward_return)
+        ic_vector = np.array([self._ic.get_ic(n) for n in SIGNAL_NAMES])
+        self._kalman.update(ic_vector, regime)
+        logger.debug(
+            f"IC bar-score | regime={regime.value} fwd_ret={forward_return:+.6f}"
+        )
+
+    def _log_kalman_weights(self, context: str) -> None:
+        """Log all four regime weight vectors at INFO for visibility."""
+        for r in RegimeState:
+            weights = self._kalman.get_weights(r)
+            formatted = " ".join(f"{k}={v:.4f}" for k, v in weights.items())
+            logger.info(f"Kalman weights [{context}] | {r.value}: {formatted}")
+
+    async def _warm_start_ic(self) -> None:
+        """Warm-start IC/Kalman from historical bars with strict no-lookahead.
+
+        Replays the warm-up history bar by bar through a throwaway
+        ``DataManager`` + ``SignalEngine`` + ``RegimeClassifier`` so every
+        signal and the regime classification see only bars up to the one
+        being scored, then applies the same forward-return scoring used
+        live.  Runs only when the Kalman weights are still at their uniform
+        priors, so restored or already-trained state is never double-counted.
+
+        Bars are replayed with naive timestamps so the MediumBuffer's
+        90-minute wall-clock eviction cannot silently drop them mid-replay.
+        """
+        if not config.ic_warm_start_enabled:
+            return
+
+        from phase2.ensemble import INITIAL_WEIGHT
+
+        for r in RegimeState:
+            if any(
+                abs(v - INITIAL_WEIGHT) > 1e-9
+                for v in self._kalman.get_weights(r).values()
+            ):
+                logger.info(
+                    "IC warm start skipped — weights already trained "
+                    "(restored from state or scored this session)"
+                )
+                return
+
+        df = self._dm.to_dataframe()
+        if df.empty or len(df) < 40:
+            logger.info("IC warm start skipped — insufficient history")
+            return
+
+        import logging as _logging
+        from collections import deque as _deque
+
+        replay_dm = DataManager.__new__(DataManager)
+        # Minimal init: only the attributes signal/regime computation touches
+        replay_dm.fast_primary = type(self._dm.fast_primary)()
+        replay_dm.fast_benchmark = type(self._dm.fast_benchmark)()
+        replay_dm.medium_primary = type(self._dm.medium_primary)()
+        replay_dm.slow_buffer = type(self._dm.slow_buffer)()
+        replay_dm._session_open_ts = None
+        replay_dm._hist_bars = _deque(maxlen=200)
+        replay_dm._tick_history = _deque(maxlen=100)
+        replay_dm._last_tick_price = None
+        replay_dm._is_crypto = config.is_crypto()
+        replay_dm._is_forex = config.is_forex()
+        replay_dm._vwap_proxy_logged = True
+        replay_dm.ic_snapshots = _deque()
+
+        replay_engine = SignalEngine(replay_dm)
+        replay_regime = RegimeClassifier()
+
+        # Silence per-bar DEBUG/INFO chatter from the replay components
+        muted = ["phase2.signals", "phase2.regime", "phase2.data"]
+        saved_levels = {n: _logging.getLogger(n).level for n in muted}
+        for n in muted:
+            _logging.getLogger(n).setLevel(_logging.WARNING)
+
+        scored = 0
+        try:
+            pending: _deque = _deque()
+            fwd = max(1, config.ic_forward_bars)
+            for row in df.to_dict("records"):
+                ts = row.get("timestamp")
+                naive_ts = (
+                    ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) else ts
+                )
+                bar = {**row, "timestamp": naive_ts}
+                replay_dm.medium_primary.append(bar)
+                replay_dm._hist_bars.append(bar)
+                replay_dm.fast_primary.append({
+                    "timestamp": ts,
+                    "symbol": config.primary_symbol,
+                    "price": float(row["close"]),
+                    "bid": None,
+                    "ask": None,
+                    "bid_size": 0,
+                    "ask_size": 0,
+                    "volume": float(row.get("volume", 1.0)),
+                })
+
+                bar_regime = replay_regime.classify(replay_dm)
+                bar_scores = replay_engine.compute_all(bar_regime)
+                price = float(row["close"])
+
+                pending.append((price, bar_scores, bar_regime))
+                if len(pending) > fwd:
+                    p0, s0, r0 = pending.popleft()
+                    if p0 > 1e-9:
+                        self._score_ic_observation(s0, r0, (price - p0) / p0)
+                        scored += 1
+        except Exception as exc:
+            logger.warning(f"IC warm start aborted after {scored} bars: {exc!r}")
+        finally:
+            for n, lvl in saved_levels.items():
+                _logging.getLogger(n).setLevel(lvl)
+
+        if scored > 0:
+            logger.info(
+                f"IC warm start | scored {scored} bars | "
+                "weights initialized from history"
+            )
+            self._log_kalman_weights("warm-start")
 
     async def _handle_broker_close(self, record: Any) -> None:
         """Feed a broker-side close (TP/SL hit on OANDA) into the learning loop.
