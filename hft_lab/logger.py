@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from logging.handlers import TimedRotatingFileHandler
 
 import colorlog
@@ -143,3 +144,31 @@ def get_logger(name: str) -> logging.Logger:
     """
     _configure_root_logger()
     return logging.getLogger(name)
+
+
+def summarize_broker_error(e: BaseException, limit: int = 300) -> str:
+    """Compress a broker exception into a log-safe one-liner.
+
+    OANDA outages can return full Cloudflare HTML error pages (including
+    base64-encoded fonts) as the exception body — tens of thousands of
+    characters.  Detect those and reduce them to the error code and Ray ID;
+    truncate everything else to *limit* characters.
+
+    Args:
+        e:     The caught broker exception (e.g. ``V20Error``).
+        limit: Maximum characters of a non-HTML message to keep.
+
+    Returns:
+        A short, log-safe summary string.
+    """
+    msg = str(e)
+    if "<!DOCTYPE html" in msg or "<html" in msg:
+        ray = re.search(r"Ray ID: (\w+)", msg)
+        code = re.search(r"cf-error-(\d+)", msg)
+        return (
+            f"OANDA returned an HTML error page "
+            f"(Cloudflare {code.group(1) if code else '5xx'}, "
+            f"Ray ID {ray.group(1) if ray else 'unknown'}) "
+            "— broker-side outage, not an API error"
+        )
+    return msg[:limit] + ("… [truncated]" if len(msg) > limit else "")

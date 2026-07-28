@@ -34,7 +34,7 @@ from oandapyV20 import API
 from oandapyV20.endpoints import instruments as oanda_instruments
 from oandapyV20.endpoints import pricing
 
-from logger import get_logger
+from logger import get_logger, summarize_broker_error
 
 logger = get_logger(__name__)
 
@@ -138,7 +138,8 @@ class OANDAHistoricalFetcher:
 
         except Exception as exc:
             logger.error(
-                f"OANDAHistoricalFetcher.fetch_candles({instrument}): {exc!r}"
+                f"OANDAHistoricalFetcher.fetch_candles({instrument}): "
+                f"{summarize_broker_error(exc)}"
             )
             return []
 
@@ -375,7 +376,7 @@ class OANDAStreamingConnection:
                     logger.error(
                         f"FOREX stream error "
                         f"(attempt {attempt}/{RECONNECT_MAX_ATTEMPTS}): "
-                        f"{type(exc).__name__}: {exc}"
+                        f"{type(exc).__name__}: {summarize_broker_error(exc)}"
                     )
 
         finally:

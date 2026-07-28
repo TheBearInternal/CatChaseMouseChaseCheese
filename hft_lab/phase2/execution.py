@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from config import config
-from logger import get_logger
+from logger import get_logger, summarize_broker_error
 from phase2.data import DataManager
 from phase2.sizing import SpreadAdjuster
 
@@ -243,7 +243,7 @@ class OrderExecutor:
                 return None
             return response.get("positions", [])
         except Exception as exc:
-            logger.warning(f"OANDA position fetch failed: {exc!r}")
+            logger.warning(f"OANDA position fetch failed: {summarize_broker_error(exc)}")
             return None
 
     def _build_tracker_from_snapshot(
@@ -337,7 +337,9 @@ class OrderExecutor:
             )
             return count
         except Exception as exc:
-            logger.warning(f"OANDA position count check failed: {exc!r}")
+            logger.warning(
+                f"OANDA position count check failed: {summarize_broker_error(exc)}"
+            )
             return None
 
     @staticmethod
@@ -492,7 +494,9 @@ class OrderExecutor:
         except Exception as exc:
             # The order may have reached OANDA before the failure — never
             # assume no fill happened; reconcile with OANDA instead
-            logger.error(f"OANDA order submission failed: {exc!r}")
+            logger.error(
+                f"OANDA order submission failed: {summarize_broker_error(exc)}"
+            )
             self._last_order_attempt_ts = time.time()
             reconcile_needed = True
         finally:
@@ -541,7 +545,8 @@ class OrderExecutor:
             return False
         except Exception as exc:
             logger.warning(
-                f"Trade protection check failed for {trade_id}: {exc!r} "
+                f"Trade protection check failed for {trade_id}: "
+                f"{summarize_broker_error(exc)} "
                 "— assuming protected (on-fill dependents are atomic)"
             )
             return True
@@ -870,7 +875,10 @@ class OrderExecutor:
                         )
                         closed.append(oid)
                     else:
-                        logger.error(f"OANDA close position {oid} failed: {exc!r}")
+                        logger.error(
+                            f"OANDA close position {oid} failed: "
+                            f"{summarize_broker_error(exc)}"
+                        )
             async with self._positions_lock:
                 for oid in closed:
                     self._open_positions.pop(oid, None)
@@ -1001,7 +1009,8 @@ class OrderExecutor:
                 # live on OANDA — keep it tracked so the FIFO guard holds, set
                 # the cooldown, and let the next attempt or monitor retry
                 logger.error(
-                    f"close_position_by_symbol({symbol}): {exc!r} — keeping "
+                    f"close_position_by_symbol({symbol}): "
+                    f"{summarize_broker_error(exc)} — keeping "
                     "position tracked for retry; cooldown set"
                 )
                 self._last_order_attempt_ts = time.time()
