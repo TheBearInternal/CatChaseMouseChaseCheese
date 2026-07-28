@@ -49,6 +49,11 @@ PRE_CLOSE_MINUTES: int = 15
 TICK_INTERVAL_S: float = 1.0       # main loop cadence
 ERROR_BACKOFF_S: float = 5.0       # sleep after a per-tick exception
 
+# Daily FX rollover window (America/New_York) — spreads blow out around the
+# 17:00 swap, so no new forex entries are opened inside it
+ROLLOVER_START: dtime = dtime(16, 55, 0)
+ROLLOVER_END: dtime = dtime(17, 15, 0)
+
 
 # ---------------------------------------------------------------------------
 # MarketCalendar
@@ -158,6 +163,18 @@ class MarketCalendar:
         """
         return 0 < self.time_to_close() < minutes * 60
 
+    def is_rollover_blackout(self) -> bool:
+        """Return True during the daily FX rollover window (16:55–17:15 EST).
+
+        Spreads widen sharply around the 17:00 New York swap.  Callers use this
+        to suppress *new* entries; positions already open are unaffected.
+
+        Returns:
+            ``True`` when the current New York time is inside the window.
+        """
+        now_t = datetime.now(EST).time()
+        return ROLLOVER_START <= now_t < ROLLOVER_END
+
     def current_minute(self) -> int:
         """Return minutes elapsed since today's market open (0-based).
 
@@ -233,6 +250,7 @@ class SessionManager:
         self._last_calendar_log_ts: float = 0.0
         self._last_summary_ts: float = 0.0
         self._last_suppressed_minute: Optional[int] = None
+        self._in_rollover_blackout: bool = False
         # Broker-side closes discovered by the position sync feed the same
         # IC/Kalman learning path the equity flow uses
         self._executor.trade_close_listener = self._handle_broker_close
@@ -437,6 +455,20 @@ class SessionManager:
                 f"risk_mult={risk_mult:.2f} threshold_mult={threshold_mult:.2f}"
             )
 
+        # 1b. FX rollover blackout state transition (log once each way)
+        if config.is_forex():
+            in_blackout = self._calendar.is_rollover_blackout()
+            if in_blackout != self._in_rollover_blackout:
+                if in_blackout:
+                    logger.info(
+                        "Rollover blackout | 16:55–17:15 EST — new entries blocked"
+                    )
+                else:
+                    logger.info(
+                        "Rollover blackout ended — new entries allowed"
+                    )
+                self._in_rollover_blackout = in_blackout
+
         # 2. Regime classification
         regime = self._regime.classify(self._dm)
 
@@ -559,6 +591,12 @@ class SessionManager:
                     f"({30.0 - (time.time() - last_ts):.0f}s remaining) — skipping"
                 )
                 return
+
+        # Rollover blackout: block new entries only — the FIFO block above
+        # already handled (and allowed) reversal exits on open positions
+        if config.is_forex() and self._calendar.is_rollover_blackout():
+            logger.debug("Rollover blackout active — skipping new entry")
+            return
 
         # Behavioral activity filter — log once per suppressed minute
         current_min = self._calendar.current_minute()

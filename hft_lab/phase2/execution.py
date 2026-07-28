@@ -236,6 +236,7 @@ class OrderExecutor:
         self._order_in_flight: bool = False             # defers tracker syncs mid-submission
         self._positions_lock: asyncio.Lock = asyncio.Lock()
         self._tracker_version: int = 0                  # bumped on every tracker mutation
+        self._spread_gate_blocked: bool = False         # log-once flag for the spread gate
         # Async callback(TradeRecord) invoked for each broker-side close the
         # sync discovers — SessionManager wires this to the IC/Kalman update
         self.trade_close_listener: Optional[Any] = None
@@ -551,8 +552,8 @@ class OrderExecutor:
         side: str,
         qty: int,
         entry_price: float,
-        stop_price: float,
-        tp_price: float,
+        stop_distance: float,
+        tp_distance: float,
         atr_value: float,
         signal_scores: Dict[str, float],
         weights: Dict[str, float],
@@ -561,15 +562,17 @@ class OrderExecutor:
     ) -> Optional[Position]:
         """Submit a market bracket order to OANDA and return a tracked Position.
 
-        OANDA handles stop-loss and take-profit server-side.  Positive units
-        indicate a long (buy); negative units indicate a short (sell).
+        Stop-loss and take-profit are sent as *distances*, not absolute prices,
+        so OANDA anchors both levels to the actual fill price.  This keeps the
+        realized risk/reward ratio exactly ``config.risk_reward_ratio`` no
+        matter how much the market moved between quote and fill.
 
         Args:
             side:          "LONG" or "SHORT".
             qty:           OANDA units (base currency, e.g. 1000 = 1 micro-lot).
-            entry_price:   Mid price at submission time (for tracking only).
-            stop_price:    Stop-loss price in instrument quote currency.
-            tp_price:      Take-profit price in instrument quote currency.
+            entry_price:   Mid price at submission time (logging / fallback).
+            stop_distance: Positive stop-loss distance from the fill price.
+            tp_distance:   Positive take-profit distance from the fill price.
             atr_value:     Raw ATR used for stop/tp calculation (logged).
             signal_scores: Signal scores at decision time.
             weights:       Ensemble weights at decision time.
@@ -581,6 +584,15 @@ class OrderExecutor:
         from oandapyV20.endpoints import orders as oanda_orders
 
         instrument = config.primary_symbol
+
+        # OANDA rejects non-positive distances outright
+        if stop_distance <= 0.0 or tp_distance <= 0.0:
+            logger.error(
+                f"Refusing order: non-positive bracket distance | "
+                f"stop={stop_distance:.5f} tp={tp_distance:.5f}"
+            )
+            return None
+
         units = str(qty) if side == "LONG" else str(-qty)
         order_data = {
             "order": {
@@ -588,18 +600,19 @@ class OrderExecutor:
                 "instrument": instrument,
                 "units": units,
                 "takeProfitOnFill": {
-                    "price": f"{tp_price:.5f}",
+                    "distance": f"{tp_distance:.5f}",
                 },
                 "stopLossOnFill": {
-                    "price": f"{stop_price:.5f}",
+                    "distance": f"{stop_distance:.5f}",
                     "timeInForce": "GTC",
                 },
             }
         }
 
         logger.info(
-            f"Order | {side} {qty} {instrument} @ {entry_price:.5f} | "
-            f"stop={stop_price:.5f} tp={tp_price:.5f} | ATR={atr_value:.5f}"
+            f"Order | {side} {qty} {instrument} @ ~{entry_price:.5f} | "
+            f"stop_dist={stop_distance:.5f} tp_dist={tp_distance:.5f} "
+            f"| ATR={atr_value:.5f}"
         )
 
         reconcile_needed = False
@@ -646,14 +659,24 @@ class OrderExecutor:
                     )
                     reconcile_needed = True
                 else:
+                    # Record the broker's actual fill price and derive the
+                    # bracket levels OANDA anchored to it
+                    fill_price = float(fill_tx.get("price") or entry_price)
+                    if side == "LONG":
+                        stop_price = fill_price - stop_distance
+                        tp_price = fill_price + tp_distance
+                    else:
+                        stop_price = fill_price + stop_distance
+                        tp_price = fill_price - tp_distance
+
                     # A fill is live money: track it unconditionally
                     position = Position(
                         symbol=instrument,
                         side=side,
-                        entry_price=entry_price,
+                        entry_price=fill_price,
                         quantity=qty,
-                        stop_price=stop_price,
-                        take_profit_price=tp_price,
+                        stop_price=round(stop_price, 5),
+                        take_profit_price=round(tp_price, 5),
                         entry_time=datetime.now(timezone.utc),
                         order_id=str(order_id),
                         signal_scores_at_entry=dict(signal_scores),
@@ -666,7 +689,8 @@ class OrderExecutor:
                     self._tracker_version += 1
                     logger.info(
                         f"OANDA order filled: id={order_id} trade={trade_id} "
-                        f"regime={regime_name}"
+                        f"fill={fill_price:.5f} stop={stop_price:.5f} "
+                        f"tp={tp_price:.5f} regime={regime_name}"
                     )
                     self._last_order_attempt_ts = 0.0
                     self._last_order_time[instrument] = time.time()
@@ -805,6 +829,26 @@ class OrderExecutor:
             logger.warning("Cannot submit order: price unavailable")
             return None
 
+        # --- Spread entry gate (forex) ------------------------------------
+        if config.is_forex():
+            spread = (
+                max(0.0, ask - bid) if (bid is not None and ask is not None) else 0.0
+            )
+            if spread > config.max_entry_spread:
+                if not self._spread_gate_blocked:
+                    logger.info(
+                        f"Entry blocked | spread={spread:.5f} exceeds "
+                        f"max={config.max_entry_spread:.5f}"
+                    )
+                    self._spread_gate_blocked = True
+                return None
+            if self._spread_gate_blocked:
+                logger.info(
+                    f"Entry unblocked | spread={spread:.5f} back below "
+                    f"max={config.max_entry_spread:.5f}"
+                )
+                self._spread_gate_blocked = False
+
         if side == "LONG":
             stop_price = entry_price - stop_distance
             tp_price = entry_price + take_profit_distance
@@ -822,8 +866,8 @@ class OrderExecutor:
                 side=side,
                 qty=quantity,
                 entry_price=entry_price,
-                stop_price=round(stop_price, 5),
-                tp_price=round(tp_price, 5),
+                stop_distance=round(stop_distance, 5),
+                tp_distance=round(take_profit_distance, 5),
                 atr_value=atr_value,
                 signal_scores=signal_scores,
                 weights=weights,

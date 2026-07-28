@@ -261,13 +261,38 @@ class ATRSizer:
             )
         return atr
 
+    def _current_spread(self) -> float:
+        """Live bid-ask spread in price units, or 0.0 when quotes are missing."""
+        bid = self._dm.fast_primary.latest_bid()
+        ask = self._dm.fast_primary.latest_ask()
+        if bid is None or ask is None:
+            return 0.0
+        return max(0.0, ask - bid)
+
     def compute_stop_distance(self) -> float:
         """Return stop-loss distance = ATR_STOP_MULTIPLIER × current ATR.
 
+        For forex the result is additionally floored at
+        ``MIN_STOP_SPREAD_MULTIPLE × current spread`` so a stop can never sit
+        close enough to the entry that the spread alone triggers it during a
+        liquidity event.
+
         Returns:
-            Stop distance in dollars.
+            Stop distance in price units.
         """
-        return self._compute_atr() * config.atr_stop_multiplier
+        stop_distance = self._compute_atr() * config.atr_stop_multiplier
+
+        if config.is_forex():
+            spread = self._current_spread()
+            spread_floor = spread * config.min_stop_spread_multiple
+            if spread_floor > stop_distance:
+                logger.warning(
+                    f"Stop widened for spread | atr_stop={stop_distance:.5f} "
+                    f"spread={spread:.5f} → {spread_floor:.5f}"
+                )
+                stop_distance = spread_floor
+
+        return stop_distance
 
     def compute_take_profit_distance(self, stop_distance: float) -> float:
         """Return take-profit distance = stop_distance × RISK_REWARD_RATIO.
