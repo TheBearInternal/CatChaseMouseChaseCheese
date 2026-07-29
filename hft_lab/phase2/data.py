@@ -141,7 +141,11 @@ class MediumBuffer:
             bar: Dict with OHLCV data and a ``timestamp`` key.
         """
         self._bars.append(bar)
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=MEDIUM_BUFFER_WINDOW_MINUTES)
+        # Window scales with the configured bar timeframe so capacity stays
+        # ~MEDIUM_BUFFER_WINDOW_MINUTES bars regardless of BAR_TIMEFRAME
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            minutes=MEDIUM_BUFFER_WINDOW_MINUTES * config.bar_timeframe_minutes()
+        )
         self._bars = [
             b for b in self._bars
             if b["timestamp"].tzinfo is not None and b["timestamp"] >= cutoff
@@ -344,7 +348,10 @@ class DataManager:
         ts = tick_data.get("timestamp") or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        minute = ts.replace(second=0, microsecond=0)
+        # Floor to the configured bar timeframe (epoch-aligned buckets)
+        bucket_s = config.bar_timeframe_minutes() * 60
+        epoch = int(ts.timestamp())
+        minute = datetime.fromtimestamp(epoch - (epoch % bucket_s), tz=timezone.utc)
         volume = float(tick_data.get("volume") or 1.0)
 
         if self._current_bar is None or self._current_bar_minute is None:
@@ -444,17 +451,26 @@ class DataManager:
         if config.is_forex():
             return await self._warm_up_forex(symbol, benchmark_symbol, n_bars)
 
-        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        tf_minutes = config.bar_timeframe_minutes()
+        if tf_minutes >= 60 and tf_minutes % 60 == 0:
+            bar_tf = TimeFrame(tf_minutes // 60, TimeFrameUnit.Hour)
+        else:
+            bar_tf = TimeFrame(tf_minutes, TimeFrameUnit.Minute)
+        # Lookback must cover n_bars at the configured timeframe (×3 margin
+        # for weekends/closed hours)
+        lookback_days = max(4, (n_bars * tf_minutes * 3) // (60 * 24) + 1)
 
         def _fetch() -> Any:
-            start = datetime.now(timezone.utc) - timedelta(days=4)
+            start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             if config.is_crypto():
                 from alpaca.data.historical import CryptoHistoricalDataClient
                 from alpaca.data.requests import CryptoBarsRequest
                 client = CryptoHistoricalDataClient()  # no auth required
                 request = CryptoBarsRequest(
                     symbol_or_symbols=[symbol, benchmark_symbol],
-                    timeframe=TimeFrame.Minute,
+                    timeframe=bar_tf,
                     start=start,
                     limit=n_bars,
                 )
@@ -468,7 +484,7 @@ class DataManager:
                 )
                 request = StockBarsRequest(
                     symbol_or_symbols=[symbol, benchmark_symbol],
-                    timeframe=TimeFrame.Minute,
+                    timeframe=bar_tf,
                     start=start,
                     limit=n_bars,
                 )
@@ -574,9 +590,12 @@ class DataManager:
                 config.oanda_account_id,
                 config.oanda_environment,
             )
+            granularity = config.oanda_granularity()
             return (
-                fetcher.fetch_candles(symbol, count=n_bars),
-                fetcher.fetch_candles(benchmark_symbol, count=n_bars),
+                fetcher.fetch_candles(symbol, count=n_bars, granularity=granularity),
+                fetcher.fetch_candles(
+                    benchmark_symbol, count=n_bars, granularity=granularity
+                ),
             )
 
         try:

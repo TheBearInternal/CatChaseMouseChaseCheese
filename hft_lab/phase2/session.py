@@ -55,6 +55,28 @@ ROLLOVER_START: dtime = dtime(16, 55, 0)
 ROLLOVER_END: dtime = dtime(17, 15, 0)
 
 
+def _parse_trading_sessions(raw: str) -> List[tuple]:
+    """Parse TRADING_SESSIONS into (start, end) time tuples.
+
+    Accepts comma-separated ``HH:MM-HH:MM`` ranges (America/New_York).
+    Malformed entries are skipped with a warning; an empty string yields an
+    empty list, which disables the session filter.
+    """
+    sessions: List[tuple] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            start_s, end_s = part.split("-")
+            sh, sm = start_s.strip().split(":")
+            eh, em = end_s.strip().split(":")
+            sessions.append((dtime(int(sh), int(sm)), dtime(int(eh), int(em))))
+        except (ValueError, AttributeError):
+            logger.warning(f"Ignoring malformed trading session {part!r}")
+    return sessions
+
+
 # ---------------------------------------------------------------------------
 # MarketCalendar
 # ---------------------------------------------------------------------------
@@ -252,6 +274,12 @@ class SessionManager:
         self._last_suppressed_minute: Optional[int] = None
         self._in_rollover_blackout: bool = False
         self._last_ic_bar_ts: Optional[Any] = None
+        self._regime_gate_logged: Optional[str] = None
+        self._trading_sessions: List[tuple] = _parse_trading_sessions(
+            config.trading_sessions
+        )
+        self._session_window_open: Optional[bool] = None
+        self._post_close_log_key: Optional[float] = None
         # Broker-side closes discovered by the position sync feed the same
         # IC/Kalman learning path the equity flow uses
         self._executor.trade_close_listener = self._handle_broker_close
@@ -386,6 +414,28 @@ class SessionManager:
                 "suppressed until sufficient data accumulates"
             )
 
+        # Timeframe visibility: effective bar size + median ATR of history
+        hist_df = self._dm.to_dataframe()
+        if len(hist_df) > config.atr_period + 1:
+            highs = hist_df["high"].values.astype(float)
+            lows = hist_df["low"].values.astype(float)
+            closes = hist_df["close"].values.astype(float)
+            tr = np.maximum(
+                highs[1:] - lows[1:],
+                np.maximum(
+                    np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:] - closes[:-1]),
+                ),
+            )
+            atr_series = pd.Series(tr).ewm(
+                alpha=1.0 / config.atr_period, adjust=False
+            ).mean()
+            logger.info(
+                f"Timeframe | {config.bar_timeframe} | "
+                f"median ATR over {len(hist_df)} bars = "
+                f"{float(atr_series.median()):.5f}"
+            )
+
         # Fit GARCH on available historical returns
         await self._fit_garch()
 
@@ -476,6 +526,18 @@ class SessionManager:
                         "Rollover blackout ended — new entries allowed"
                     )
                 self._in_rollover_blackout = in_blackout
+
+            # 1c. Trading-session window transition (log once each way)
+            in_window = self._in_trading_session()
+            if in_window != self._session_window_open:
+                if in_window:
+                    logger.info("Session | trading window open")
+                else:
+                    logger.info(
+                        f"Session | outside trading window "
+                        f"({config.trading_sessions}) — entries blocked"
+                    )
+                self._session_window_open = in_window
 
         # 2. Regime classification
         regime = self._regime.classify(self._dm)
@@ -620,6 +682,33 @@ class SessionManager:
         if config.is_forex() and self._calendar.is_rollover_blackout():
             logger.debug("Rollover blackout active — skipping new entry")
             return
+
+        # Regime gate: only enter in configured regimes (empty set disables)
+        if config.tradeable_regimes and regime.value not in config.tradeable_regimes:
+            if self._regime_gate_logged != regime.value:
+                logger.info(f"Regime gate | {regime.value} not tradeable — holding")
+                self._regime_gate_logged = regime.value
+            return
+        self._regime_gate_logged = None
+
+        # Trading-session filter: forex entries only inside configured windows
+        if config.is_forex() and not self._in_trading_session():
+            return
+
+        # Post-close cooldown: no re-entry into just-closed conditions
+        # (signal_reversal closes are exempt and never anchor the cooldown)
+        last_close = self._executor.last_close_time(config.primary_symbol)
+        if last_close > 0:
+            elapsed = time.time() - last_close
+            if elapsed < config.post_close_cooldown_s:
+                if self._post_close_log_key != last_close:
+                    remaining = int(config.post_close_cooldown_s - elapsed)
+                    logger.info(
+                        f"Post-close cooldown | {config.primary_symbol} | "
+                        f"{remaining}s remaining"
+                    )
+                    self._post_close_log_key = last_close
+                return
 
         # Behavioral activity filter — log once per suppressed minute
         current_min = self._calendar.current_minute()
@@ -766,6 +855,24 @@ class SessionManager:
                         f"Position monitor | reconciled {before_count} → "
                         f"{after_count} tracked position(s)"
                     )
+
+    def _in_trading_session(self) -> bool:
+        """Return True when the current New York time is inside a trading window.
+
+        An empty TRADING_SESSIONS config disables the filter (always True).
+        Ranges where start > end are treated as crossing midnight.
+        """
+        if not self._trading_sessions:
+            return True
+        now_t = datetime.now(EST).time()
+        for start, end in self._trading_sessions:
+            if start <= end:
+                if start <= now_t < end:
+                    return True
+            else:  # crosses midnight, e.g. 22:00-02:00
+                if now_t >= start or now_t < end:
+                    return True
+        return False
 
     def _score_ic_observation(
         self,

@@ -237,6 +237,7 @@ class OrderExecutor:
         self._positions_lock: asyncio.Lock = asyncio.Lock()
         self._tracker_version: int = 0                  # bumped on every tracker mutation
         self._spread_gate_blocked: bool = False         # log-once flag for the spread gate
+        self._last_close_time_by_symbol: Dict[str, float] = {}  # post-close cooldown anchor
         # Async callback(TradeRecord) invoked for each broker-side close the
         # sync discovers — SessionManager wires this to the IC/Kalman update
         self.trade_close_listener: Optional[Any] = None
@@ -377,6 +378,20 @@ class OrderExecutor:
                 self._dm.slow_buffer.save(config.session_state_path)
         except Exception as exc:
             logger.warning(f"Failed to clear trade metadata {trade_id}: {exc!r}")
+
+    def note_position_close(self, symbol: str, reason: str) -> None:
+        """Anchor the post-close cooldown for *symbol*.
+
+        Closes with reason ``signal_reversal`` are exempt — they represent a
+        deliberate directional change, not an adverse exit.
+        """
+        if reason == "signal_reversal":
+            return
+        self._last_close_time_by_symbol[symbol] = time.time()
+
+    def last_close_time(self, symbol: str) -> float:
+        """Return the epoch time of the last non-exempt close for *symbol* (0.0 if none)."""
+        return self._last_close_time_by_symbol.get(symbol, 0.0)
 
     def _note_last_transaction_id(self, last_id: Optional[str]) -> None:
         """Track OANDA's most recently seen transaction ID (monotonic)."""
@@ -713,6 +728,7 @@ class OrderExecutor:
             if fill is not None:
                 self._note_last_transaction_id(fill.get("last_tx"))
             self._clear_trade_metadata(pos.trade_id)
+            self.note_position_close(record.symbol, record.exit_reason)
 
         async with self._positions_lock:
             for oid, _pos in closed_entries:
@@ -1280,6 +1296,7 @@ class OrderExecutor:
                 )
                 self._logger.log_trade(record)
                 closed_trades.append(record)
+                self.note_position_close(record.symbol, record.exit_reason)
             else:
                 still_open[oid] = pos
 
@@ -1340,6 +1357,7 @@ class OrderExecutor:
                     ))
                     closed.append(oid)
                     self._clear_trade_metadata(pos.trade_id)
+                    self.note_position_close(pos.symbol, reason)
                 except Exception as exc:
                     exc_str = str(exc)
                     if "CLOSEOUT_POSITION_DOESNT_EXIST" in exc_str:
@@ -1465,6 +1483,7 @@ class OrderExecutor:
                 self._open_positions.pop(pos_id, None)
                 self._tracker_version += 1
             self._clear_trade_metadata(pos_to_close.trade_id)
+            self.note_position_close(symbol, reason)
             logger.info(
                 f"Position closed | {symbol} {pos_to_close.side} "
                 f"reason={reason} net={net:+.4f}"

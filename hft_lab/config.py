@@ -199,6 +199,10 @@ class Config:
     # Continuous bar-level IC scoring
     ic_forward_bars: int
     ic_warm_start_enabled: bool
+    # Entry gating
+    tradeable_regimes: frozenset
+    trading_sessions: str
+    post_close_cooldown_s: float
     # News strategy fields
     reddit_sentiment_enabled: bool
     reddit_client_id: str
@@ -215,6 +219,38 @@ class Config:
             ``True`` if ``alpaca_base_url`` matches the live trading URL.
         """
         return self.alpaca_base_url.rstrip("/") == LIVE_BASE_URL.rstrip("/")
+
+    def bar_timeframe_minutes(self) -> int:
+        """Return the configured bar timeframe in whole minutes.
+
+        Parses BAR_TIMEFRAME strings like ``1Min``, ``5Min``, ``15Min``,
+        ``1Hour``, ``4H`` or a bare number of minutes.  Falls back to 1 on
+        any parse failure so the engine degrades to 1-minute bars rather
+        than crashing.
+        """
+        raw = self.bar_timeframe.strip().lower()
+        try:
+            if raw.endswith("min"):
+                return max(1, int(raw[:-3]))
+            if raw.endswith("hour"):
+                return max(1, int(raw[:-4])) * 60
+            if raw.endswith("h"):
+                return max(1, int(raw[:-1])) * 60
+            if raw.endswith("m"):
+                return max(1, int(raw[:-1]))
+            return max(1, int(raw))
+        except ValueError:
+            return 1
+
+    def oanda_granularity(self) -> str:
+        """Return the OANDA candle granularity string for BAR_TIMEFRAME.
+
+        e.g. 1 → ``M1``, 15 → ``M15``, 60 → ``H1``, 240 → ``H4``.
+        """
+        minutes = self.bar_timeframe_minutes()
+        if minutes >= 60 and minutes % 60 == 0:
+            return f"H{minutes // 60}"
+        return f"M{minutes}"
 
     def is_crypto(self) -> bool:
         """Return ``True`` when the engine is configured for cryptocurrency markets.
@@ -326,6 +362,16 @@ def _load_config() -> Config:
         ic_warm_start_enabled=_parse_bool(
             os.getenv("IC_WARM_START_ENABLED", "true"), "IC_WARM_START_ENABLED"
         ),
+        # Empty TRADEABLE_REGIMES disables the regime gate entirely
+        tradeable_regimes=frozenset(
+            s.strip().upper()
+            for s in os.getenv(
+                "TRADEABLE_REGIMES", "TRENDING,MEAN_REVERTING"
+            ).split(",")
+            if s.strip()
+        ),
+        trading_sessions=os.getenv("TRADING_SESSIONS", "08:00-12:00"),
+        post_close_cooldown_s=float(os.getenv("POST_CLOSE_COOLDOWN_S", "300")),
         reddit_client_id=os.getenv("REDDIT_CLIENT_ID", ""),
         reddit_client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
     )
