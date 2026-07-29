@@ -199,6 +199,8 @@ class Config:
     # Continuous bar-level IC scoring
     ic_forward_bars: int
     ic_warm_start_enabled: bool
+    # Kalman weight magnitude cap (per-signal |w| ceiling after L1 norm)
+    max_signal_weight: float
     # Entry gating
     tradeable_regimes: frozenset
     trading_sessions: str
@@ -362,6 +364,7 @@ def _load_config() -> Config:
         ic_warm_start_enabled=_parse_bool(
             os.getenv("IC_WARM_START_ENABLED", "true"), "IC_WARM_START_ENABLED"
         ),
+        max_signal_weight=float(os.getenv("MAX_SIGNAL_WEIGHT", "0.6")),
         # Empty TRADEABLE_REGIMES disables the regime gate entirely
         tradeable_regimes=frozenset(
             s.strip().upper()

@@ -38,7 +38,61 @@ INITIAL_WEIGHT: float = 1.0 / N_SIGNALS
 INITIAL_COV_SCALE: float = 0.1
 REGIME_BOOST_FACTOR: float = 0.20     # fractional weight boost in aligned regime
 SENTIMENT_MODIFIER_SCALE: float = 0.20
-MIN_WEIGHT_FLOOR: float = 0.01        # minimum weight to prevent zeroing a signal
+L1_NORM_TOLERANCE: float = 1e-6       # startup assertion tolerance on sum(|w|)
+
+
+def _l1_normalize(w: "np.ndarray", cap: Optional[float] = None) -> "np.ndarray":
+    """L1-normalize a signed weight vector so sum(|w|) == 1, retaining sign.
+
+    Unlike sum-normalization, the denominator sum(|w|) can never be negative
+    or cancel to ~zero for a non-degenerate vector, so the vector's signs are
+    never inverted.  A degenerate (all ~zero / non-finite) vector falls back
+    to uniform positive weights.
+
+    Args:
+        w:   Raw signed weight vector.
+        cap: Optional per-element magnitude ceiling; elements with |w| above
+             it are clipped (sign preserved) and the vector re-normalized,
+             iterating until no element violates the cap.
+
+    Returns:
+        Signed vector with sum(|w|) == 1.
+    """
+    w = np.asarray(w, dtype=float)
+    n = len(w)
+    total = float(np.sum(np.abs(w)))
+    if not np.isfinite(total) or total < 1e-12:
+        return np.full(n, 1.0 / n)
+    w = w / total
+    if cap is None:
+        return w
+
+    signs = np.sign(w)
+    signs[signs == 0.0] = 1.0
+    m = np.abs(w)
+
+    # A cap below 1/n cannot satisfy sum(|w|) == 1; uniform magnitude is the
+    # closest feasible point.
+    if cap * n <= 1.0 + 1e-12:
+        return signs * (1.0 / n)
+
+    # Water-filling: pin violators at the cap and redistribute the remaining
+    # budget across the rest, repeating since redistribution can push a
+    # previously-compliant element over.  Terminates in <= n rounds because
+    # each round pins at least one more element.
+    for _ in range(n):
+        over = m > cap + 1e-15
+        if not over.any():
+            break
+        free = ~over
+        m[over] = cap
+        budget = 1.0 - cap * float(over.sum())
+        free_sum = float(m[free].sum())
+        if free_sum > 1e-15:
+            m[free] = m[free] * (budget / free_sum)
+        elif free.any():
+            m[free] = budget / float(free.sum())
+    return signs * m
 
 
 # ---------------------------------------------------------------------------
@@ -183,10 +237,8 @@ class KalmanEnsemble:
         """Log at DEBUG whenever the active regime vector changes."""
         if regime == self._active_regime:
             return
-        w = self._weights[regime]
-        w_pos = np.maximum(w, MIN_WEIGHT_FLOOR)
-        w_norm = w_pos / w_pos.sum()
-        w_str = "[" + " ".join(f"{v:.4f}" for v in w_norm) + "]"
+        w_norm = _l1_normalize(self._weights[regime], cap=config.max_signal_weight)
+        w_str = "[" + " ".join(f"{v:+.4f}" for v in w_norm) + "]"
         logger.debug(
             f"Kalman | switching to {regime.value} weights | w={w_str}"
         )
@@ -246,21 +298,23 @@ class KalmanEnsemble:
         )
 
     def get_weights(self, regime: RegimeState) -> Dict[str, float]:
-        """Return normalized, strictly-positive weight dict for *regime*.
+        """Return the L1-normalized SIGNED weight dict for *regime*.
 
-        All raw weights are floored at ``MIN_WEIGHT_FLOOR`` then normalized
-        so they sum to 1.0.
+        Negative weights survive intact — a negative weight means "fade this
+        signal", which the Kalman filter learns when a signal's IC is
+        consistently negative.  The vector is L1-normalized (sum of absolute
+        weights == 1.0) so signs are never inverted by a near-zero or
+        negative plain sum, and each |weight| is capped at
+        ``config.max_signal_weight`` to stop one signal dominating.
 
         Args:
             regime: The regime whose weight vector to use.
 
         Returns:
-            Dict mapping signal name to weight in (0, 1] summing to 1.0.
+            Dict mapping signal name to signed weight with sum(|w|) == 1.0.
         """
         self._maybe_log_switch(regime)
-        w = self._weights[regime]
-        w_pos = np.maximum(w, MIN_WEIGHT_FLOOR)
-        w_norm = w_pos / w_pos.sum()
+        w_norm = _l1_normalize(self._weights[regime], cap=config.max_signal_weight)
         return {name: float(w_norm[i]) for i, name in enumerate(SIGNAL_NAMES)}
 
     # ------------------------------------------------------------------
@@ -278,6 +332,16 @@ class KalmanEnsemble:
         for regime, key in self._REGIME_SAVE_KEY.items():
             state[f"kalman_weights_{key}"] = self._weights[regime].tolist()
             state[f"kalman_covariance_{key}"] = self._covariance[regime].tolist()
+            norm = _l1_normalize(
+                self._weights[regime], cap=config.max_signal_weight
+            )
+            state[f"kalman_weights_normalized_{key}"] = norm.tolist()
+            logger.info(
+                f"Kalman persist [{regime.value}] | " + " ".join(
+                    f"{SIGNAL_NAMES[i]}={norm[i]:+.4f}"
+                    for i in range(N_SIGNALS)
+                )
+            )
         return state
 
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -295,7 +359,12 @@ class KalmanEnsemble:
             try:
                 w = np.array(state["weights"], dtype=float)
                 P = np.array(state["covariance"], dtype=float)
-                if w.shape == (N_SIGNALS,) and P.shape == (N_SIGNALS, N_SIGNALS):
+                if (
+                    w.shape == (N_SIGNALS,)
+                    and P.shape == (N_SIGNALS, N_SIGNALS)
+                    and np.isfinite(w).all()
+                    and np.isfinite(P).all()
+                ):
                     for r in RegimeState:
                         self._weights[r] = w.copy()
                         self._covariance[r] = P.copy()
@@ -303,6 +372,7 @@ class KalmanEnsemble:
                         "KalmanEnsemble: upgraded legacy single-vector state "
                         "→ broadcast to all 4 regime vectors"
                     )
+                    self._verify_loaded_state()
                     return
             except Exception:
                 pass
@@ -314,6 +384,12 @@ class KalmanEnsemble:
                 w = np.array(state[f"kalman_weights_{key}"], dtype=float)
                 P = np.array(state[f"kalman_covariance_{key}"], dtype=float)
                 if w.shape == (N_SIGNALS,) and P.shape == (N_SIGNALS, N_SIGNALS):
+                    if not (np.isfinite(w).all() and np.isfinite(P).all()):
+                        logger.error(
+                            f"KalmanEnsemble: non-finite state for "
+                            f"{regime.value} — keeping that regime at priors"
+                        )
+                        continue
                     self._weights[regime] = w
                     self._covariance[regime] = P
                     loaded += 1
@@ -325,10 +401,35 @@ class KalmanEnsemble:
                 f"KalmanEnsemble: loaded {loaded}/4 regime weight vectors "
                 "from session state"
             )
+            self._verify_loaded_state()
         else:
             logger.warning(
                 "KalmanEnsemble: no valid vectors found in state — "
                 "all regimes start at equal weights"
+            )
+
+    def _verify_loaded_state(self) -> None:
+        """Startup assertion: every regime's vector is finite and L1-normalizes.
+
+        Logs the full signed normalized vector per regime at INFO so negative
+        (fade) weights are visible immediately after restore.
+        """
+        for regime in RegimeState:
+            w = self._weights[regime]
+            assert np.isfinite(w).all(), (
+                f"Kalman weights for {regime.value} are non-finite after load"
+            )
+            norm = _l1_normalize(w, cap=config.max_signal_weight)
+            l1 = float(np.sum(np.abs(norm)))
+            assert abs(l1 - 1.0) < L1_NORM_TOLERANCE, (
+                f"L1 normalization invariant violated for {regime.value}: "
+                f"sum(|w|)={l1}"
+            )
+            logger.info(
+                f"Kalman loaded [{regime.value}] | " + " ".join(
+                    f"{SIGNAL_NAMES[i]}={norm[i]:+.4f}"
+                    for i in range(N_SIGNALS)
+                )
             )
 
 
@@ -422,12 +523,19 @@ class EnsembleDecision:
     ) -> Dict[str, float]:
         """Adjust weights based on which signals suit the current regime.
 
+        Sign-preserving throughout: boosting a negative (fade) weight
+        increases its magnitude rather than pulling it toward positive, and
+        the RANDOM_WALK entropy blend shrinks toward uniform *magnitude*
+        carrying each weight's own sign.  Blending toward a positive uniform
+        prior would flip any weight whose magnitude sits below ``equal``,
+        destroying exactly the fade information the Kalman filter learned.
+
         Args:
-            weights: Base weight dict from KalmanEnsemble.
+            weights: Base signed weight dict from KalmanEnsemble.
             regime:  Current RegimeState.
 
         Returns:
-            Renormalized weight dict.
+            L1-renormalized signed weight dict (sum of |weights| == 1.0).
         """
         w = dict(weights)
 
@@ -439,9 +547,13 @@ class EnsembleDecision:
             w["vwap"] *= (1.0 + REGIME_BOOST_FACTOR)
         elif regime == RegimeState.RANDOM_WALK:
             equal = 1.0 / N_SIGNALS
-            w = {k: 0.5 * v + 0.5 * equal for k, v in w.items()}
+            w = {
+                k: 0.5 * v + 0.5 * math.copysign(equal, v if v != 0.0 else 1.0)
+                for k, v in w.items()
+            }
 
-        total = sum(w.values())
-        if total > 1e-8:
-            w = {k: v / total for k, v in w.items()}
-        return w
+        vec = _l1_normalize(
+            np.array([w[name] for name in SIGNAL_NAMES], dtype=float),
+            cap=config.max_signal_weight,
+        )
+        return {name: float(vec[i]) for i, name in enumerate(SIGNAL_NAMES)}
