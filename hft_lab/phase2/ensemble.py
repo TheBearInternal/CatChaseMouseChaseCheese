@@ -40,6 +40,13 @@ REGIME_BOOST_FACTOR: float = 0.20     # fractional weight boost in aligned regim
 SENTIMENT_MODIFIER_SCALE: float = 0.20
 L1_NORM_TOLERANCE: float = 1e-6       # startup assertion tolerance on sum(|w|)
 
+# Weight-semantics version stamped into saved state.  Files written before
+# signed weights existed carry no such key: their raw vectors could already
+# hold negatives, but those were inert because get_weights() floored every
+# weight at +0.01.  Restoring one now makes those negatives ACTIVE fade
+# weights, which can change trade direction — so the load path says so loudly.
+WEIGHTS_FORMAT: str = "signed_l1_v2"
+
 
 def _l1_normalize(w: "np.ndarray", cap: Optional[float] = None) -> "np.ndarray":
     """L1-normalize a signed weight vector so sum(|w|) == 1, retaining sign.
@@ -328,7 +335,7 @@ class KalmanEnsemble:
             Dict with keys ``kalman_weights_<regime>`` and
             ``kalman_covariance_<regime>`` for each RegimeState.
         """
-        state: Dict[str, Any] = {}
+        state: Dict[str, Any] = {"weights_format": WEIGHTS_FORMAT}
         for regime, key in self._REGIME_SAVE_KEY.items():
             state[f"kalman_weights_{key}"] = self._weights[regime].tolist()
             state[f"kalman_covariance_{key}"] = self._covariance[regime].tolist()
@@ -401,6 +408,7 @@ class KalmanEnsemble:
                 f"KalmanEnsemble: loaded {loaded}/4 regime weight vectors "
                 "from session state"
             )
+            self._warn_if_legacy_semantics(state)
             self._verify_loaded_state()
         else:
             logger.warning(
@@ -408,23 +416,75 @@ class KalmanEnsemble:
                 "all regimes start at equal weights"
             )
 
+    def _warn_if_legacy_semantics(self, state: Dict[str, Any]) -> None:
+        """Warn when a pre-signed-weights state file carries negative weights.
+
+        Such files were written when ``get_weights()`` floored everything at
+        +0.01, so any stored negative was inert.  Under signed weights the same
+        file activates them as fade weights, which can flip trade direction on
+        the first tick after upgrading.  The weights are kept (learned negative
+        ICs are real information), but the change is surfaced explicitly rather
+        than happening silently.
+        """
+        if state.get("weights_format") == WEIGHTS_FORMAT:
+            return
+        negatives = {
+            regime.value: [
+                SIGNAL_NAMES[i]
+                for i in range(N_SIGNALS)
+                if self._weights[regime][i] < 0.0
+            ]
+            for regime in RegimeState
+        }
+        flagged = {r: sigs for r, sigs in negatives.items() if sigs}
+        if not flagged:
+            return
+        logger.warning(
+            "KalmanEnsemble: session state predates signed weights "
+            f"(no '{WEIGHTS_FORMAT}' stamp). Negative weights that were "
+            "previously floored to +0.01 are now ACTIVE fade weights and may "
+            "reverse trade direction: "
+            + "; ".join(f"{r}: {', '.join(s)}" for r, s in flagged.items())
+            + ". Delete the state file to relearn from priors if unintended."
+        )
+
     def _verify_loaded_state(self) -> None:
-        """Startup assertion: every regime's vector is finite and L1-normalizes.
+        """Startup check: every regime's vector is finite and L1-normalizes.
+
+        Deliberately does NOT raise.  ``load_state`` is called from
+        ``SessionManager._session_start``, which is not exception-guarded, and
+        the engine's shutdown handler unconditionally re-saves state — so
+        raising here would crash startup AND let the shutdown path overwrite a
+        good ``session_state.json`` with half-loaded weights.  A violated
+        invariant therefore logs at ERROR and resets that regime to priors,
+        which is recoverable.  (A bare ``assert`` would also be stripped
+        entirely under ``python -O``, silently removing the check.)
 
         Logs the full signed normalized vector per regime at INFO so negative
         (fade) weights are visible immediately after restore.
         """
         for regime in RegimeState:
             w = self._weights[regime]
-            assert np.isfinite(w).all(), (
-                f"Kalman weights for {regime.value} are non-finite after load"
-            )
+            if not np.isfinite(w).all():
+                logger.error(
+                    f"Kalman weights for {regime.value} are non-finite after "
+                    "load — resetting this regime to equal-weight priors"
+                )
+                self._weights[regime] = np.full(N_SIGNALS, INITIAL_WEIGHT)
+                self._covariance[regime] = np.eye(N_SIGNALS) * INITIAL_COV_SCALE
+                w = self._weights[regime]
             norm = _l1_normalize(w, cap=config.max_signal_weight)
             l1 = float(np.sum(np.abs(norm)))
-            assert abs(l1 - 1.0) < L1_NORM_TOLERANCE, (
-                f"L1 normalization invariant violated for {regime.value}: "
-                f"sum(|w|)={l1}"
-            )
+            if abs(l1 - 1.0) > L1_NORM_TOLERANCE:
+                logger.error(
+                    f"L1 normalization invariant violated for {regime.value}: "
+                    f"sum(|w|)={l1:.9f} — resetting this regime to priors"
+                )
+                self._weights[regime] = np.full(N_SIGNALS, INITIAL_WEIGHT)
+                self._covariance[regime] = np.eye(N_SIGNALS) * INITIAL_COV_SCALE
+                norm = _l1_normalize(
+                    self._weights[regime], cap=config.max_signal_weight
+                )
             logger.info(
                 f"Kalman loaded [{regime.value}] | " + " ".join(
                     f"{SIGNAL_NAMES[i]}={norm[i]:+.4f}"
@@ -511,7 +571,8 @@ class EnsembleDecision:
             logger.debug(
                 f"Ensemble | regime={regime.value} raw={raw_score:+.4f} "
                 f"sentiment={sentiment:+.3f} modified={modified_score:+.4f} "
-                f"threshold={threshold:.2f} → {action} (conf={confidence:.4f})"
+                f"threshold={threshold:.2f} → {action} (conf={confidence:.4f}) "
+                f"| net_weight={float(np.sum(weight_arr)):+.4f}"
             )
             self._prev_raw = raw_score
             self._prev_action = action
