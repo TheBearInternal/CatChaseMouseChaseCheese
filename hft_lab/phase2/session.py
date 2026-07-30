@@ -376,6 +376,11 @@ class SessionManager:
         self._in_pre_close = False
         self._trade_logger.reset_session_pnl()
 
+        # Seed informative priors from the offline study BEFORE restoring any
+        # saved state, so live-learned weights still take precedence.
+        if config.use_study_priors:
+            self._kalman.load_study_priors(config.signal_priors_path)
+
         # Restore Kalman weights from previous session if available
         self._dm.slow_buffer.load(config.session_state_path)
         weights_state = self._dm.slow_buffer.data.get("signal_weights")
@@ -933,21 +938,43 @@ class SessionManager:
 
         from phase2.ensemble import INITIAL_WEIGHT
 
-        for r in RegimeState:
-            if any(
-                abs(v - INITIAL_WEIGHT) > 1e-9
-                for v in self._kalman.get_weights(r).values()
-            ):
-                logger.info(
-                    "IC warm start skipped — weights already trained "
-                    "(restored from state or scored this session)"
-                )
-                return
+        # With informative study priors the warm start is an UPDATE, not an
+        # initialization: the Kalman correction steps below refine the prior
+        # toward the local fit rather than replacing it, so weights end up
+        # between the two. Only weights restored from a previous live session
+        # are left alone — those already encode real trading experience.
+        if self._kalman.priors_source == "restored":
+            logger.info(
+                "IC warm start skipped — weights restored from session state"
+            )
+            return
+        if self._kalman.priors_source == "study":
+            logger.info(
+                "IC warm start | refining study priors (not overwriting them)"
+            )
+        else:
+            for r in RegimeState:
+                if any(
+                    abs(v - INITIAL_WEIGHT) > 1e-9
+                    for v in self._kalman.get_weights(r).values()
+                ):
+                    logger.info(
+                        "IC warm start skipped — weights already trained "
+                        "(scored this session)"
+                    )
+                    return
 
         df = self._dm.to_dataframe()
         if df.empty or len(df) < 40:
             logger.info("IC warm start skipped — insufficient history")
             return
+        logger.info(
+            f"IC warm start | history available: {len(df)} bars "
+            f"(HISTORICAL_BARS={config.historical_bars})"
+        )
+        prior_snapshot = {
+            r.value: dict(self._kalman.get_weights(r)) for r in RegimeState
+        }
 
         import logging as _logging
         from collections import deque as _deque
@@ -1016,10 +1043,30 @@ class SessionManager:
                 _logging.getLogger(n).setLevel(lvl)
 
         if scored > 0:
-            logger.info(
-                f"IC warm start | scored {scored} bars | "
-                "weights initialized from history"
+            verb = (
+                "refined from study priors"
+                if self._kalman.priors_source == "study"
+                else "initialized from history"
             )
+            logger.info(f"IC warm start | scored {scored} bars | weights {verb}")
+            # Show that the prior was refined, not discarded: report how far
+            # each regime moved off its starting point.
+            if prior_snapshot:
+                for r in RegimeState:
+                    post = self._kalman.get_weights(r)
+                    pre = prior_snapshot.get(r.value, {})
+                    if not pre:
+                        continue
+                    drift = sum(
+                        abs(post[n] - pre.get(n, 0.0)) for n in post
+                    )
+                    logger.info(
+                        f"Kalman prior->post [{r.value}] | L1 drift={drift:.4f} "
+                        + " ".join(
+                            f"{n}:{pre.get(n, 0.0):+.3f}->{post[n]:+.3f}"
+                            for n in post
+                        )
+                    )
             self._log_kalman_weights("warm-start")
 
     async def _handle_broker_close(self, record: Any) -> None:

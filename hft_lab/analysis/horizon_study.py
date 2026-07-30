@@ -587,6 +587,83 @@ def build_correlations(scored_by_instrument: Dict[str, pd.DataFrame]) -> pd.Data
     return out
 
 
+def write_signal_priors(results: pd.DataFrame, instruments: List[str]) -> str:
+    """Emit ``signal_priors.json`` for seeding the live Kalman filter.
+
+    For each regime, takes the mean TEST-split IC per live signal across all
+    instruments at the horizon closest to the engine's own forward-return
+    holding period (``BAR_TIMEFRAME x IC_FORWARD_BARS``), then L1-normalizes
+    preserving sign.  Only reliable cells contribute, and the per-signal
+    observation count and mean |t| ride along so the engine can size its
+    initial covariance by how well-evidenced each weight is.
+
+    ``relative_strength`` is emitted from whichever construction
+    ``RELATIVE_STRENGTH_MODE`` selects, so the prior matches what runs live.
+    """
+    import json
+    from config import config
+    from phase2.regime import RegimeState
+    from phase2.signals import SIGNAL_NAMES
+
+    target_minutes = config.bar_timeframe_minutes() * max(1, config.ic_forward_bars)
+    k = min(HORIZONS, key=lambda h: abs(h * BAR_MINUTES - target_minutes))
+    rs_col = (
+        "relative_strength_index"
+        if config.relative_strength_mode == "index"
+        else "relative_strength_single"
+    )
+
+    payload: Dict = {
+        "_meta": {
+            "instruments": instruments,
+            "granularity": GRANULARITY,
+            "horizon_bars": int(k),
+            "horizon_minutes": int(k * BAR_MINUTES),
+            "target_holding_minutes": int(target_minutes),
+            "relative_strength_source": rs_col,
+            "signal_order": list(SIGNAL_NAMES),
+            "split": "test",
+        },
+        "regimes": {},
+    }
+
+    test = results[(results["split"] == "test") & results["reliable"]]
+    for regime in RegimeState:
+        raw: List[float] = []
+        stats: Dict[str, Dict] = {}
+        for name in SIGNAL_NAMES:
+            col = rs_col if name == "relative_strength" else name
+            sub = test[
+                (test["regime"] == regime.value)
+                & (test["horizon_bars"] == k)
+                & (test["signal"] == col)
+            ]
+            ic = float(sub["ic"].mean()) if len(sub) else 0.0
+            raw.append(0.0 if not np.isfinite(ic) else ic)
+            stats[name] = {
+                "n": int(sub["n_obs"].sum()) if len(sub) else 0,
+                "mean_abs_t": (
+                    float(sub["t_nw"].abs().mean()) if len(sub) else 0.0
+                ),
+                "instruments": int(len(sub)),
+            }
+        vec = np.array(raw, dtype=float)
+        total = float(np.sum(np.abs(vec)))
+        if total < 1e-12:
+            vec = np.full(len(SIGNAL_NAMES), 1.0 / len(SIGNAL_NAMES))
+        else:
+            vec = vec / total          # L1 = 1, signs preserved
+        payload["regimes"][regime.value] = {
+            "weights": {n: float(vec[i]) for i, n in enumerate(SIGNAL_NAMES)},
+            "stats": stats,
+        }
+
+    path = os.path.join(OUTPUT_DIR, "signal_priors.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
 def build_consistency(results: pd.DataFrame, instruments: List[str]) -> pd.DataFrame:
     """Cross-instrument view: test-split, pooled-regime IC per (signal, horizon).
 
@@ -983,8 +1060,10 @@ def main() -> None:
     report_md = write_markdown(
         results, costs, consistency, instruments, args.years, correlations
     )
+    priors_path = write_signal_priors(results, instruments)
 
-    print(f"\nWrote {summary_csv}")
+    print(f"\nWrote {priors_path}")
+    print(f"Wrote {summary_csv}")
     print(f"Wrote {consistency_csv}")
     print(f"Wrote {corr_csv}")
     print(f"Wrote {cost_csv}")

@@ -235,6 +235,157 @@ class KalmanEnsemble:
         self._Q: np.ndarray = np.eye(N_SIGNALS) * config.kalman_process_noise
         self._R: float = config.kalman_measurement_noise
         self._active_regime: Optional[RegimeState] = None
+        # L1-normalized shrinkage target for the net-bias cap, and provenance
+        # so the warm start knows whether it is refining or initializing.
+        self._prior_weights: Dict[RegimeState, np.ndarray] = {
+            r: np.full(N_SIGNALS, INITIAL_WEIGHT) for r in RegimeState
+        }
+        self.priors_source: str = "uniform"
+        self._net_cap_logged: Dict[RegimeState, bool] = {r: False for r in RegimeState}
+
+    def load_study_priors(self, path: str) -> bool:
+        """Seed each regime's weights and covariance from the offline study.
+
+        Weights come from ``signal_priors.json`` (mean test-split IC per
+        signal, L1-normalized).  Initial covariance is scaled by how
+        well-evidenced each weight is — more observations and larger |t| give
+        a tighter prior, so the filter moves off it more slowly::
+
+            confidence = mean|t| x min(1, n / 1000)
+            variance   = INITIAL_COV_SCALE / (1 + confidence)
+
+        Args:
+            path: Path to signal_priors.json.
+
+        Returns:
+            ``True`` when at least one regime was seeded.
+        """
+        import json
+        import os
+
+        if not os.path.exists(path):
+            logger.info(
+                f"Kalman priors | no study file at {path} — starting at uniform 1/6"
+            )
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            logger.warning(f"Kalman priors | unreadable ({exc!r}) — using uniform")
+            return False
+
+        regimes = payload.get("regimes") or {}
+        meta = payload.get("_meta") or {}
+        seeded = 0
+        for regime in RegimeState:
+            entry = regimes.get(regime.value)
+            if not entry:
+                continue
+            weights = entry.get("weights") or {}
+            stats = entry.get("stats") or {}
+            try:
+                vec = np.array(
+                    [float(weights[n]) for n in SIGNAL_NAMES], dtype=float
+                )
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    f"Kalman priors | {regime.value} malformed — skipping"
+                )
+                continue
+            if not np.isfinite(vec).all():
+                logger.warning(
+                    f"Kalman priors | {regime.value} non-finite — skipping"
+                )
+                continue
+
+            vec = _l1_normalize(vec, cap=config.max_signal_weight)
+            self._weights[regime] = vec.copy()
+            self._prior_weights[regime] = vec.copy()
+
+            variances = []
+            for name in SIGNAL_NAMES:
+                st = stats.get(name) or {}
+                n_obs = float(st.get("n", 0) or 0)
+                mean_t = float(st.get("mean_abs_t", 0.0) or 0.0)
+                confidence = mean_t * min(1.0, n_obs / 1000.0)
+                variances.append(INITIAL_COV_SCALE / (1.0 + max(confidence, 0.0)))
+            self._covariance[regime] = np.diag(variances)
+            seeded += 1
+
+            detail = " ".join(
+                f"{SIGNAL_NAMES[i]}={vec[i]:+.4f}" for i in range(N_SIGNALS)
+            )
+            tot_n = sum(int((stats.get(n) or {}).get("n", 0)) for n in SIGNAL_NAMES)
+            avg_t = float(np.mean([
+                float((stats.get(n) or {}).get("mean_abs_t", 0.0))
+                for n in SIGNAL_NAMES
+            ]))
+            logger.info(
+                f"Kalman priors | loaded from study | {regime.value}: {detail} "
+                f"(n={tot_n}, mean|t|={avg_t:.2f})"
+            )
+
+        if seeded:
+            self.priors_source = "study"
+            logger.info(
+                f"Kalman priors | seeded {seeded}/4 regimes from "
+                f"{meta.get('horizon_minutes', '?')}-minute study horizon "
+                f"(rs source: {meta.get('relative_strength_source', '?')})"
+            )
+        return seeded > 0
+
+    def _apply_net_cap(
+        self, w: np.ndarray, regime: RegimeState
+    ) -> np.ndarray:
+        """Shrink *w* toward the regime's prior until |sum(w)| <= max_net_weight.
+
+        A vector whose mass is almost entirely one-signed makes the ensemble a
+        near-pure inverter (or amplifier) of whatever the signals say.  Blending
+        toward the prior pulls the net back without discarding the learned
+        per-signal structure.  Bisection is used because the L1 renormalization
+        after each blend makes the relationship non-linear.
+        """
+        cap = config.max_net_weight
+        if cap <= 0.0 or abs(float(np.sum(w))) <= cap:
+            self._net_cap_logged[regime] = False
+            return w
+
+        prior = _l1_normalize(
+            self._prior_weights[regime], cap=config.max_signal_weight
+        )
+        if abs(float(np.sum(prior))) > cap:
+            # Even the prior is more one-sided than the cap; nothing to shrink
+            # toward, so leave the vector alone rather than distort it.
+            if not self._net_cap_logged[regime]:
+                logger.warning(
+                    f"Net-weight cap | {regime.value} | net="
+                    f"{float(np.sum(w)):+.4f} exceeds {cap:.2f} but the prior "
+                    f"(net={float(np.sum(prior)):+.4f}) does too — not shrinking"
+                )
+                self._net_cap_logged[regime] = True
+            return w
+
+        before = float(np.sum(w))
+        lo, hi = 0.0, 1.0
+        best = _l1_normalize(prior, cap=config.max_signal_weight)
+        for _ in range(40):
+            mid = (lo + hi) / 2.0
+            cand = _l1_normalize(
+                (1.0 - mid) * w + mid * prior, cap=config.max_signal_weight
+            )
+            if abs(float(np.sum(cand))) <= cap:
+                best, hi = cand, mid
+            else:
+                lo = mid
+        if not self._net_cap_logged[regime]:
+            logger.warning(
+                f"Net-weight cap | {regime.value} | net={before:+.4f} -> "
+                f"{float(np.sum(best)):+.4f} (cap {cap:.2f}, shrunk {hi:.0%} "
+                "toward study prior)"
+            )
+            self._net_cap_logged[regime] = True
+        return best
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -322,6 +473,7 @@ class KalmanEnsemble:
         """
         self._maybe_log_switch(regime)
         w_norm = _l1_normalize(self._weights[regime], cap=config.max_signal_weight)
+        w_norm = self._apply_net_cap(w_norm, regime)
         return {name: float(w_norm[i]) for i, name in enumerate(SIGNAL_NAMES)}
 
     # ------------------------------------------------------------------
@@ -408,6 +560,7 @@ class KalmanEnsemble:
                 f"KalmanEnsemble: loaded {loaded}/4 regime weight vectors "
                 "from session state"
             )
+            self.priors_source = "restored"
             self._warn_if_legacy_semantics(state)
             self._verify_loaded_state()
         else:

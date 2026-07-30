@@ -143,10 +143,12 @@ class MediumBuffer:
             bar: Dict with OHLCV data and a ``timestamp`` key.
         """
         self._bars.append(bar)
-        # Window scales with the configured bar timeframe so capacity stays
-        # ~MEDIUM_BUFFER_WINDOW_MINUTES bars regardless of BAR_TIMEFRAME
+        # Window must span at least HISTORICAL_BARS bars, otherwise warm-up
+        # data is evicted the moment it lands: at BAR_TIMEFRAME=1Min a plain
+        # 90-minute window kept only ~90 of 500 requested bars.
+        window_bars = max(MEDIUM_BUFFER_WINDOW_MINUTES, config.historical_bars)
         cutoff = datetime.now(timezone.utc) - timedelta(
-            minutes=MEDIUM_BUFFER_WINDOW_MINUTES * config.bar_timeframe_minutes()
+            minutes=window_bars * config.bar_timeframe_minutes()
         )
         self._bars = [
             b for b in self._bars
@@ -282,7 +284,11 @@ class DataManager:
         self.medium_primary: MediumBuffer = MediumBuffer()
         self.slow_buffer: SlowBuffer = SlowBuffer()
         self._session_open_ts: Optional[datetime] = None
-        self._hist_bars: deque[Dict[str, Any]] = deque(maxlen=FAST_BUFFER_MAXLEN)
+        # Sized from HISTORICAL_BARS, not FAST_BUFFER_MAXLEN — the old 200-cap
+        # silently truncated any larger warm-up request
+        self._hist_bars: deque[Dict[str, Any]] = deque(
+            maxlen=max(FAST_BUFFER_MAXLEN, config.historical_bars)
+        )
         self._tick_history: deque[tuple[float, int]] = deque(maxlen=TICK_HISTORY_MAXLEN)
         self._last_tick_price: Optional[float] = None
         # Bar-close snapshots awaiting forward-return maturity for IC scoring:
@@ -683,9 +689,17 @@ class DataManager:
                 else f"0 {benchmark_symbol} bars (unavailable)"
             )
             logger.info(
-                f"FOREX Warm-up: loaded {len(primary_bars)} {symbol} bars, "
+                f"FOREX Warm-up: requested {n_bars} bars, received "
+                f"{len(primary_bars)} {symbol} bars, retained "
+                f"{len(self._hist_bars)} hist / {len(self.medium_primary)} medium, "
                 f"{bench_note} — ready={self.is_ready}"
             )
+            if len(self._hist_bars) < min(n_bars, len(primary_bars)):
+                logger.warning(
+                    f"Warm-up retention shortfall: requested {n_bars}, "
+                    f"received {len(primary_bars)}, retained "
+                    f"{len(self._hist_bars)} — buffers are truncating history"
+                )
             return self.is_ready
 
         except Exception as exc:

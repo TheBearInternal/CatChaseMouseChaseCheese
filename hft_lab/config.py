@@ -201,6 +201,11 @@ class Config:
     ic_warm_start_enabled: bool
     # Kalman weight magnitude cap (per-signal |w| ceiling after L1 norm)
     max_signal_weight: float
+    # Ceiling on |sum(w)| — bounds how one-sided the ensemble may become
+    max_net_weight: float
+    # Seed Kalman priors from the offline study instead of uniform 1/6
+    use_study_priors: bool
+    signal_priors_path: str
     # Relative-strength construction: "single" (one benchmark pair) or
     # "index" (idiosyncratic residual vs a synthetic USD index)
     relative_strength_mode: str
@@ -383,6 +388,13 @@ def _load_config() -> Config:
             os.getenv("IC_WARM_START_ENABLED", "true"), "IC_WARM_START_ENABLED"
         ),
         max_signal_weight=float(os.getenv("MAX_SIGNAL_WEIGHT", "0.6")),
+        max_net_weight=float(os.getenv("MAX_NET_WEIGHT", "0.6")),
+        use_study_priors=_parse_bool(
+            os.getenv("USE_STUDY_PRIORS", "true"), "USE_STUDY_PRIORS"
+        ),
+        signal_priors_path=os.getenv(
+            "SIGNAL_PRIORS_PATH", "analysis/output/signal_priors.json"
+        ),
         relative_strength_mode=os.getenv("RELATIVE_STRENGTH_MODE", "index").strip().lower(),
         usd_index_pairs=tuple(
             s.strip().upper()
