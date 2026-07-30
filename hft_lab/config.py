@@ -201,6 +201,10 @@ class Config:
     ic_warm_start_enabled: bool
     # Kalman weight magnitude cap (per-signal |w| ceiling after L1 norm)
     max_signal_weight: float
+    # Relative-strength construction: "single" (one benchmark pair) or
+    # "index" (idiosyncratic residual vs a synthetic USD index)
+    relative_strength_mode: str
+    usd_index_pairs: tuple
     # Entry gating
     tradeable_regimes: frozenset
     trading_sessions: str
@@ -221,6 +225,20 @@ class Config:
             ``True`` if ``alpaca_base_url`` matches the live trading URL.
         """
         return self.alpaca_base_url.rstrip("/") == LIVE_BASE_URL.rstrip("/")
+
+    @staticmethod
+    def pip_size_for(symbol: str) -> float:
+        """Return the pip size for an instrument.
+
+        JPY-quoted pairs carry the pip at the 2nd decimal; every other major
+        carries it at the 4th.  Used to derive round-number level spacing and
+        pip-denominated distances without hardcoding either.
+        """
+        return 0.01 if symbol.upper().endswith("JPY") else 0.0001
+
+    def pip_size(self) -> float:
+        """Pip size for the configured primary instrument."""
+        return self.pip_size_for(self.primary_symbol)
 
     def bar_timeframe_minutes(self) -> int:
         """Return the configured bar timeframe in whole minutes.
@@ -365,6 +383,14 @@ def _load_config() -> Config:
             os.getenv("IC_WARM_START_ENABLED", "true"), "IC_WARM_START_ENABLED"
         ),
         max_signal_weight=float(os.getenv("MAX_SIGNAL_WEIGHT", "0.6")),
+        relative_strength_mode=os.getenv("RELATIVE_STRENGTH_MODE", "index").strip().lower(),
+        usd_index_pairs=tuple(
+            s.strip().upper()
+            for s in os.getenv(
+                "USD_INDEX_PAIRS", "EUR_USD,USD_JPY,AUD_USD"
+            ).split(",")
+            if s.strip()
+        ),
         # Empty TRADEABLE_REGIMES disables the regime gate entirely
         tradeable_regimes=frozenset(
             s.strip().upper()

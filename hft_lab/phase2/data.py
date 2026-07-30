@@ -38,6 +38,8 @@ SHOCK_VOLATILITY_MULTIPLIER: float = 2.0
 MIN_BARS_NORMAL: int = 50
 MIN_BARS_DEV: int = 30
 RS_LOOKBACK_TICKS: int = 20
+RS_BETA_WINDOW: int = 60          # observations used to estimate index beta
+RS_MIN_BETA_OBS: int = 20         # below this, beta is not estimable
 TICK_HISTORY_MAXLEN: int = 100   # rolling window for Lee-Ready tick-rule proxy
 
 
@@ -272,6 +274,11 @@ class DataManager:
     def __init__(self) -> None:
         self.fast_primary: FastBuffer = FastBuffer()
         self.fast_benchmark: FastBuffer = FastBuffer()
+        # One buffer per USD-index constituent (index relative-strength mode).
+        # Keyed by instrument so N benchmarks are supported, not just one.
+        self.fast_benchmarks: Dict[str, FastBuffer] = {
+            pair: FastBuffer() for pair in config.usd_index_pairs
+        }
         self.medium_primary: MediumBuffer = MediumBuffer()
         self.slow_buffer: SlowBuffer = SlowBuffer()
         self._session_open_ts: Optional[datetime] = None
@@ -329,8 +336,13 @@ class DataManager:
                 self._last_tick_price = float(price)
                 self._aggregate_tick_into_bar(tick_data, float(price))
 
-        elif symbol == config.benchmark_symbol:
-            self.fast_benchmark.append(tick_data)
+        else:
+            # A symbol may serve as both the legacy single benchmark and a
+            # USD-index constituent, so route to every matching buffer.
+            if symbol == config.benchmark_symbol or symbol == config.forex_benchmark:
+                self.fast_benchmark.append(tick_data)
+            if symbol in self.fast_benchmarks:
+                self.fast_benchmarks[symbol].append(tick_data)
 
     def _aggregate_tick_into_bar(
         self, tick_data: Dict[str, Any], price: float
@@ -584,6 +596,12 @@ class DataManager:
         """
         from phase2.forex import OANDAHistoricalFetcher
 
+        # Index constituents are warmed too so beta is estimable from tick one
+        index_pairs = [
+            p for p in self.fast_benchmarks
+            if p not in (symbol, benchmark_symbol)
+        ]
+
         def _fetch() -> tuple:
             fetcher = OANDAHistoricalFetcher(
                 config.oanda_api_key,
@@ -596,15 +614,50 @@ class DataManager:
                 fetcher.fetch_candles(
                     benchmark_symbol, count=n_bars, granularity=granularity
                 ),
+                {
+                    pair: fetcher.fetch_candles(
+                        pair, count=n_bars, granularity=granularity
+                    )
+                    for pair in index_pairs
+                },
             )
 
         try:
             loop = asyncio.get_running_loop()
-            primary_bars, bench_bars = await loop.run_in_executor(None, _fetch)
+            primary_bars, bench_bars, index_bars = await loop.run_in_executor(
+                None, _fetch
+            )
 
             for bar in primary_bars:
                 self._hist_bars.append(bar)
                 self.medium_primary.append(bar)
+
+            # Populate every USD-index buffer (primary/benchmark may also be
+            # constituents, so seed those from the series already fetched)
+            for pair, buf in self.fast_benchmarks.items():
+                if pair == symbol:
+                    src = primary_bars
+                elif pair == benchmark_symbol:
+                    src = bench_bars
+                else:
+                    src = index_bars.get(pair, [])
+                if not src:
+                    logger.warning(
+                        f"0 {pair} bars for USD index — relative_strength "
+                        "index mode will be degraded"
+                    )
+                    continue
+                for bar in src[-(RS_BETA_WINDOW + RS_LOOKBACK_TICKS + 2):]:
+                    buf.append({
+                        "timestamp": bar["timestamp"],
+                        "symbol": pair,
+                        "price": bar["close"],
+                        "bid": None,
+                        "ask": None,
+                        "bid_size": 0,
+                        "ask_size": 0,
+                        "volume": bar["volume"],
+                    })
 
             if not bench_bars:
                 logger.warning(
@@ -696,6 +749,87 @@ class DataManager:
         prim_ret = (prim_prices[-1] / prim_prices[-n]) - 1.0
         bench_ret = (bench_prices[-1] / bench_prices[-n]) - 1.0
         return float(prim_ret - bench_ret)
+
+    def compute_usd_index_returns(self) -> Optional[np.ndarray]:
+        """Return per-step log returns of a synthetic USD index.
+
+        Equal-weighted across ``config.usd_index_pairs``.  USD/JPY is quoted
+        with the dollar as the base currency while EUR/USD and AUD/USD quote it
+        as the term currency, so its return is inverted to put all three on a
+        common axis (following the stated construction, the resulting index
+        rises as the dollar *weakens*).  The overall sign is irrelevant
+        downstream: the beta regression absorbs it, leaving the residual
+        unchanged either way.
+
+        Returns:
+            1-D array of index log returns, or ``None`` when fewer than two
+            constituents have enough data.
+        """
+        series: List[np.ndarray] = []
+        for pair, buf in self.fast_benchmarks.items():
+            df = buf.to_dataframe()
+            if df.empty or "price" not in df.columns:
+                continue
+            prices = df["price"].dropna().values.astype(float)
+            if len(prices) < RS_MIN_BETA_OBS + 1:
+                continue
+            rets = np.diff(np.log(np.maximum(prices, 1e-12)))
+            # USD-base quote (USD/XXX) moves opposite to XXX/USD quotes
+            if pair.upper().startswith("USD_"):
+                rets = -rets
+            series.append(rets)
+
+        if len(series) < 2:
+            return None
+        n = min(len(s) for s in series)
+        if n < RS_MIN_BETA_OBS:
+            return None
+        stacked = np.vstack([s[-n:] for s in series])
+        return stacked.mean(axis=0)
+
+    def compute_relative_strength_index(self) -> Optional[float]:
+        """Return the primary pair's idiosyncratic return vs the USD index.
+
+        Regresses the primary pair's returns on the synthetic index over a
+        rolling window and reports the residual of the recent cumulative move::
+
+            beta      = cov(r_primary, r_index) / var(r_index)
+            residual  = cum_ret_primary - beta * cum_ret_index
+
+        This isolates pair-specific strength, unlike the raw difference used by
+        ``single`` mode, where two ~85 %-correlated majors leave mostly noise.
+
+        Returns:
+            Residual return as float, or ``None`` if inputs are unavailable.
+        """
+        idx_rets = self.compute_usd_index_returns()
+        if idx_rets is None:
+            return None
+
+        prim_df = self.fast_primary.to_dataframe()
+        if prim_df.empty or "price" not in prim_df.columns:
+            return None
+        prim_prices = prim_df["price"].dropna().values.astype(float)
+        if len(prim_prices) < RS_MIN_BETA_OBS + 1:
+            return None
+        prim_rets = np.diff(np.log(np.maximum(prim_prices, 1e-12)))
+
+        n = min(len(prim_rets), len(idx_rets), RS_BETA_WINDOW)
+        if n < RS_MIN_BETA_OBS:
+            return None
+        p_win = prim_rets[-n:]
+        i_win = idx_rets[-n:]
+
+        var_i = float(np.var(i_win))
+        if var_i < 1e-18:
+            return None
+        beta = float(np.cov(p_win, i_win, bias=True)[0, 1] / var_i)
+
+        # Residual of the recent cumulative move, matching single mode's horizon
+        k = min(RS_LOOKBACK_TICKS, n)
+        cum_p = float(np.sum(p_win[-k:]))
+        cum_i = float(np.sum(i_win[-k:]))
+        return cum_p - beta * cum_i
 
     # ------------------------------------------------------------------
     # Readiness

@@ -216,11 +216,20 @@ async def _main() -> None:
     if config.is_forex():
         from phase2.forex import OANDAStreamingConnection
         _forex_benchmark = config.forex_benchmark
+        # Primary + legacy benchmark + every USD-index constituent, deduped
+        # while preserving order (index relative-strength needs all N streams)
+        _instruments = list(dict.fromkeys(
+            [config.primary_symbol, _forex_benchmark, *config.usd_index_pairs]
+        ))
+        logger.info(
+            f"FOREX stream instruments: {_instruments} "
+            f"(relative_strength_mode={config.relative_strength_mode})"
+        )
         stream_connection = OANDAStreamingConnection(
             api_key=config.oanda_api_key,
             account_id=config.oanda_account_id,
             environment=config.oanda_environment,
-            instruments=[config.primary_symbol, _forex_benchmark],
+            instruments=_instruments,
             data_manager=data_manager,
             order_executor=order_executor,
         )

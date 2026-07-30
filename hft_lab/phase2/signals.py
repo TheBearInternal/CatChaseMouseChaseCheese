@@ -312,7 +312,21 @@ class OrderBookSignal:
 
 
 class RelativeStrengthSignal:
-    """Asset return minus benchmark return, normalized via tanh."""
+    """Idiosyncratic strength of the primary pair.
+
+    Two constructions, selected by ``RELATIVE_STRENGTH_MODE``:
+
+    ``single``
+        Legacy: primary return minus a single benchmark pair's return.  At the
+        ~85 % correlation typical between two USD majors the residual is
+        mostly noise, which is why this scored no significant cells in the
+        horizon study.
+
+    ``index`` (default)
+        Primary return minus its **beta-adjusted** exposure to a synthetic USD
+        index built from several majors, so the output is the idiosyncratic
+        component rather than a raw difference.
+    """
 
     def __init__(self, data_manager: DataManager) -> None:
         """Initialise with a reference to the shared DataManager.
@@ -331,10 +345,72 @@ class RelativeStrengthSignal:
         Returns:
             Float in [-1.0, +1.0], or 0.0 if benchmark data unavailable.
         """
-        rs = self._dm.compute_relative_strength()
+        if config.relative_strength_mode == "index":
+            rs = self._dm.compute_relative_strength_index()
+        else:
+            rs = self._dm.compute_relative_strength()
         if rs is None:
             return 0.0
         return float(np.clip(math.tanh(rs / RS_TANH_SCALE), -1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Round Number Signal (experimental — not in the live ensemble)
+# ---------------------------------------------------------------------------
+
+# Round levels sit at X.XX00 and X.XX50, i.e. every 50 pips.  The absolute
+# spacing is derived from the instrument's pip location, never hardcoded.
+ROUND_LEVEL_PIPS: float = 50.0
+
+
+class RoundNumberSignal:
+    """Signed normalized distance from mid to the nearest round price level.
+
+    Rationale (Osler 2000, 2003, on NY Fed currency order-book data):
+    take-profit orders cluster *at* round numbers while stop-loss orders
+    cluster just *beyond* them.  Every other signal here is a function of
+    returns and has no notion of absolute price level, so this is the only
+    genuinely orthogonal feature available.
+
+    Level spacing is ``ROUND_LEVEL_PIPS x pip_size``, and pip size comes from
+    the instrument: 0.01 for JPY-quoted pairs (levels XXX.00 / XXX.50), 0.0001
+    otherwise (levels X.XX00 / X.XX50).  There are no free parameters.
+
+    Output is in [-1, +1]: ``0.0`` means price is sitting exactly on a level,
+    ``+1``/``-1`` means it is exactly midway between two levels, and the sign
+    says which side of the nearest level price is on (positive = above).
+    """
+
+    def __init__(self, data_manager: DataManager) -> None:
+        """Initialise with a reference to the shared DataManager.
+
+        Args:
+            data_manager: Shared DataManager instance.
+        """
+        self._dm = data_manager
+
+    def compute(self, regime_state: Optional[object] = None) -> float:
+        """Compute and return the round-number proximity score.
+
+        Args:
+            regime_state: Unused; present for uniform interface.
+
+        Returns:
+            Float in [-1.0, +1.0], or 0.0 if no price is available.
+        """
+        price = self._dm.fast_primary.latest_price()
+        if price is None or price <= 0.0:
+            return 0.0
+
+        # Per-instrument so the study can score several pairs with one engine
+        symbol = getattr(self._dm, "symbol", None) or config.primary_symbol
+        spacing = ROUND_LEVEL_PIPS * config.pip_size_for(symbol)
+        if spacing <= 0.0:
+            return 0.0
+
+        nearest = round(price / spacing) * spacing
+        half = spacing / 2.0
+        return float(np.clip((price - nearest) / half, -1.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +424,14 @@ SIGNAL_NAMES: tuple[str, ...] = (
     "vwap",
     "order_book",
     "relative_strength",
+)
+
+# Signals under evaluation in the offline study but deliberately NOT part of
+# the live ensemble.  Keeping them out of SIGNAL_NAMES holds N_SIGNALS at 6, so
+# the Kalman weight/covariance dimensions and every persisted session_state.json
+# stay valid.  Promote a name into SIGNAL_NAMES only once the study justifies it.
+EXPERIMENTAL_SIGNAL_NAMES: tuple[str, ...] = (
+    "round_number",
 )
 
 
@@ -370,16 +454,25 @@ class SignalEngine:
         self._vwap = VWAPSignal(data_manager)
         self._order_book = OrderBookSignal(data_manager)
         self._rs = RelativeStrengthSignal(data_manager)
+        self._round_number = RoundNumberSignal(data_manager)
         self._prev_scores: Dict[str, float] = {}
 
-    def compute_all(self, regime_state: Optional[object] = None) -> Dict[str, float]:
-        """Compute all six signal scores and return them as a named dict.
+    def compute_all(
+        self,
+        regime_state: Optional[object] = None,
+        include_experimental: bool = False,
+    ) -> Dict[str, float]:
+        """Compute the six live signal scores and return them as a named dict.
 
         All scores are logged at DEBUG level.
 
         Args:
-            regime_state: Current ``RegimeState`` forwarded to signals that
-                          use it for polarity decisions.
+            regime_state:         Current ``RegimeState`` forwarded to signals
+                                  that use it for polarity decisions.
+            include_experimental: When ``True``, additionally compute the
+                                  signals in ``EXPERIMENTAL_SIGNAL_NAMES``.
+                                  The offline study sets this; the live engine
+                                  never does, so the ensemble stays 6-wide.
 
         Returns:
             Dict mapping signal name to score in [-1.0, +1.0].
@@ -392,6 +485,8 @@ class SignalEngine:
             "order_book":        self._order_book.compute(regime_state),
             "relative_strength": self._rs.compute(regime_state),
         }
+        if include_experimental:
+            scores["round_number"] = self._round_number.compute(regime_state)
         if any(
             abs(scores[k] - self._prev_scores.get(k, -999.0)) > 0.001
             for k in scores
