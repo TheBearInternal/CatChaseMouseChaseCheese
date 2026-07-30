@@ -901,11 +901,19 @@ class SessionManager:
         )
 
     def _log_kalman_weights(self, context: str) -> None:
-        """Log all four regime weight vectors at INFO for visibility."""
+        """Log all four regime weight vectors at INFO for visibility.
+
+        Signs are always shown explicitly — a negative weight means the filter
+        learned to fade that signal, which must be readable at a glance.
+        """
         for r in RegimeState:
             weights = self._kalman.get_weights(r)
-            formatted = " ".join(f"{k}={v:.4f}" for k, v in weights.items())
-            logger.info(f"Kalman weights [{context}] | {r.value}: {formatted}")
+            formatted = " ".join(f"{k}={v:+.4f}" for k, v in weights.items())
+            net = sum(weights.values())
+            logger.info(
+                f"Kalman weights [{context}] | {r.value}: {formatted} "
+                f"| net={net:+.4f}"
+            )
 
     async def _warm_start_ic(self) -> None:
         """Warm-start IC/Kalman from historical bars with strict no-lookahead.
